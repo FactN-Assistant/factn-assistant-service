@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>LiveChat API — Dev Test Client</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>LiveChat API — Dev Test Client (fixed input)</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -21,7 +21,7 @@
       --red:       #f25c5c;
       --teal:      #3dd6c8;
       --radius:    10px;
-      --font:      'Inter', system-ui, sans-serif;
+      --font:      'Inter', system-ui, -apple-system, sans-serif;
     }
 
     body {
@@ -36,7 +36,9 @@
       grid-template-areas:
         "header header"
         "sidebar  main";
-      overflow: hidden;
+      overflow: hidden;         /* prevents whole-page scroll, keeps layout locked */
+      position: fixed;
+      width: 100%;
     }
 
     /* ── Header ── */
@@ -69,7 +71,7 @@
     #conn-dot.disconnected { background: var(--red); }
     #conn-label { font-size: 12px; color: var(--muted); }
 
-    /* ── Sidebar ── */
+    /* ── Sidebar (scrolls independently, no layout shift) ── */
     aside {
       grid-area: sidebar;
       background: var(--bg2);
@@ -79,6 +81,7 @@
       padding: 16px;
       gap: 16px;
       overflow-y: auto;
+      min-height: 0;    /* allows sidebar to scroll without breaking main grid */
     }
 
     .panel-title {
@@ -186,23 +189,58 @@
     .info-row .key   { color: var(--muted); }
     .info-row .value { color: var(--text); font-family: monospace; font-size: 11px; word-break: break-all; }
 
-    /* ── Main area ── */
+    /* ── MAIN AREA (FIXED LAYOUT: messages scroll, input stays at bottom) ── */
     main {
       grid-area: main;
       display: flex;
       flex-direction: column;
+      min-height: 0;          /* CRITICAL: allows flex children to respect overflow */
+      height: 100%;
+      overflow: hidden;       /* prevents main from pushing beyond viewport */
+      background: var(--bg);
     }
 
-    /* Chat messages */
+    /* Chat messages container — scrollable, takes all available space */
     #messages {
-      flex: 1;
+      flex: 1 1 0%;          /* takes all leftover space, allows shrinking */
       overflow-y: auto;
       padding: 20px;
       display: flex;
       flex-direction: column;
       gap: 10px;
+      min-height: 0;         /* essential for proper overflow behavior */
     }
 
+    /* Input area: fixed at bottom, never disappears */
+    #input-area {
+      flex-shrink: 0;        /* prevents input from shrinking */
+      padding: 16px 20px;
+      background: var(--bg2);
+      border-top: 1px solid var(--border);
+      display: flex;
+      gap: 10px;
+      align-items: flex-end;
+    }
+
+    #text-input {
+      flex: 1;
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+      padding: 10px 14px;
+      outline: none;
+      resize: none;
+      max-height: 120px;
+      min-height: 42px;
+      line-height: 1.5;
+    }
+    #text-input:focus { border-color: var(--accent); }
+    #text-input::placeholder { color: var(--muted); }
+
+    /* message bubbles styling (unchanged) */
     .msg {
       max-width: 75%;
       padding: 10px 14px;
@@ -227,37 +265,17 @@
       opacity: 0.7;
     }
 
-    /* Text input area */
-    #input-area {
-      padding: 16px 20px;
-      background: var(--bg2);
-      border-top: 1px solid var(--border);
-      display: flex;
-      gap: 10px;
-      align-items: flex-end;
-    }
-    #text-input {
-      flex: 1;
-      background: var(--bg3);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      color: var(--text);
-      font-family: var(--font);
-      font-size: 14px;
-      padding: 10px 14px;
-      outline: none;
-      resize: none;
-      max-height: 120px;
-      min-height: 42px;
-      line-height: 1.5;
-    }
-    #text-input:focus { border-color: var(--accent); }
-    #text-input::placeholder { color: var(--muted); }
-
     /* Scrollbar */
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 99px; }
+
+    /* ensure body never scrolls, everything contained */
+    body, html {
+      overflow: hidden;
+      margin: 0;
+      padding: 0;
+    }
   </style>
 </head>
 <body>
@@ -272,7 +290,6 @@
 
 <!-- ── Sidebar ─────────────────────────────────────────── -->
 <aside>
-
   <!-- Connection -->
   <section>
     <div class="panel-title">Connection</div>
@@ -328,13 +345,12 @@
     <div class="panel-title">Controls</div>
     <button class="btn-secondary" id="btn-clear" style="width:100%">Clear log</button>
   </section>
-
 </aside>
 
-<!-- ── Main ─────────────────────────────────────────────── -->
+<!-- ── Main (fixed chat + anchored input) ───────────────── -->
 <main>
   <div id="messages">
-    <div class="msg system">Connect to start chatting.</div>
+    <div class="msg system">Connect to start chatting. Input stays fixed at bottom.</div>
   </div>
 
   <div id="input-area">
@@ -524,7 +540,7 @@ function sendText() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Voice  (push-to-talk via mousedown / touchstart)
+// Voice  (push-to-talk)
 // ─────────────────────────────────────────────────────────────
 $btnVoice.addEventListener('mousedown',  startVoice);
 $btnVoice.addEventListener('touchstart', startVoice, { passive: true });
@@ -547,7 +563,6 @@ async function startVoice(e) {
     });
 
     const source = audioCtx.createMediaStreamSource(mediaStream);
-    // ScriptProcessorNode — deprecated but universally supported for a dev tool
     scriptProc = audioCtx.createScriptProcessor(4096, 1, 1);
     source.connect(scriptProc);
     scriptProc.connect(audioCtx.destination);
@@ -565,7 +580,6 @@ async function startVoice(e) {
       const resampled = downsampleTo16k(float32, 48000);
       const pcm16     = floatToInt16(resampled);
 
-      // Update level meter
       const rms = Math.sqrt(float32.reduce((a, v) => a + v * v, 0) / float32.length);
       $micBar.style.width = Math.min(rms * 600, 100) + '%';
 
@@ -597,7 +611,6 @@ function stopVoice(sendEnd = true) {
 // Audio resampling utilities
 // ─────────────────────────────────────────────────────────────
 function downsampleTo16k(samples, fromRate) {
-  // Linear interpolation downsample: 48000 → 16000
   const ratio     = fromRate / 16000;
   const outLen    = Math.floor(samples.length / ratio);
   const out       = new Float32Array(outLen);
@@ -623,12 +636,10 @@ function floatToInt16(float32) {
 
 // ─────────────────────────────────────────────────────────────
 // PCM playback  (Gemini output: 24 kHz, 16-bit, mono)
-// Chunks are scheduled end-to-end with no gap using nextPlayAt.
 // ─────────────────────────────────────────────────────────────
 function scheduleAudio(buffer) {
   if (!speakerOn) return;
 
-  // Lazily create/resume AudioContext for playback
   if (!audioCtx || audioCtx.state === 'closed') {
     audioCtx = new AudioContext();
   }
@@ -642,7 +653,6 @@ function scheduleAudio(buffer) {
     float32[i] = int16[i] / 32768.0;
   }
 
-  // Create an AudioBuffer at Gemini's native 24 kHz
   const audioBuf = audioCtx.createBuffer(1, float32.length, 24000);
   audioBuf.copyToChannel(float32, 0);
 
@@ -650,7 +660,6 @@ function scheduleAudio(buffer) {
   source.buffer = audioBuf;
   source.connect(audioCtx.destination);
 
-  // Schedule to play immediately after the previous chunk
   const startAt = Math.max(audioCtx.currentTime + 0.02, nextPlayAt);
   source.start(startAt);
   nextPlayAt = startAt + audioBuf.duration;
@@ -711,6 +720,7 @@ function appendMsg(type, label, text) {
   wrap.appendChild(content);
 
   $messages.appendChild(wrap);
+  // auto-scroll only within messages container (no page jump)
   $messages.scrollTop = $messages.scrollHeight;
 }
 
