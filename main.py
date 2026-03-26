@@ -3,16 +3,19 @@ main.py
 ───────
 Application entry point.
 
-What lives here
-───────────────
-  • FastAPI app creation with lifespan (startup / shutdown)
-  • SessionManager initialisation (one per process)
-  • Demo ProjectConfig loaded from .env  ← replaced by DB lookup in Week 5-6
-  • Router registration
-  • CORS middleware
+Week 5 changes from Week 2-3
+─────────────────────────────
+  • MongoDB client (Motor) initialised in lifespan
+  • Redis client initialised in lifespan
+  • MongoDB indexes ensured on startup
+  • Repositories bundle attached to app.state
+  • demo_project_config REMOVED — all project resolution now goes through
+    the repository layer via api/chat.py
+  • /health endpoint extended with DB ping results
 
 Running locally
 ───────────────
+  cp .env.example .env    # fill in MONGO_URI, REDIS_URL, GEMINI_API_KEY
   uvicorn main:app --reload --port 8000
 """
 
@@ -29,8 +32,11 @@ from fastapi.requests import Request
 from google import genai
 
 from api.chat import router as chat_router
-from core.schemas import ProjectConfig, ToolDefinition, VoiceConfig, VADConfig
 from core.session_manager import SessionManager
+from db.indexes import ensure_indexes
+from db.mongo import MongoDB
+from db.redis_client import RedisClient
+from repositories import Repositories
 
 load_dotenv()
 
@@ -47,119 +53,67 @@ log = logging.getLogger("livechat")
 
 
 # ──────────────────────────────────────────────────────────────
-# Demo project config  (Week 2-4 placeholder)
-# ──────────────────────────────────────────────────────────────
-# When the database layer arrives (Week 5-6) this whole section is replaced
-# by a repository call:  project = await ProjectRepo.get_by_api_key(api_key)
-# ──────────────────────────────────────────────────────────────
-
-def _build_demo_project() -> ProjectConfig:
-    """
-    Build a ProjectConfig from environment variables.
-
-    Set these in your .env file — see .env.example for defaults.
-    """
-    system_prompt = os.getenv(
-        "DEMO_SYSTEM_PROMPT",
-        (
-            "You are a helpful, friendly assistant. "
-            "Keep answers concise and conversational."
-        ),
-    )
-
-    # Demo tools — mix of static (instant mock responses) so you can see
-    # the full tool-call flow in the test client without a real backend.
-    demo_tools = [
-        ToolDefinition(
-            name="get_current_time",
-            description="Returns the current date and time in UTC.",
-            parameters={
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-            execution_mode="static",
-            static_response={
-                "utc": "2026-03-23T10:00:00Z",
-                "note": "This is a static demo response.",
-            },
-        ),
-        ToolDefinition(
-            name="search_knowledge_base",
-            description=(
-                "Searches the internal knowledge base for information on a topic."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query.",
-                    },
-                },
-                "required": ["query"],
-            },
-            execution_mode="static",
-            static_response={
-                "results": [
-                    {
-                        "title":   "Demo Article",
-                        "snippet": "This is a placeholder result from the static demo tool.",
-                    }
-                ]
-            },
-        ),
-    ]
-
-    return ProjectConfig(
-        project_id    = os.getenv("DEMO_PROJECT_ID",   "demo-project-001"),
-        name          = os.getenv("DEMO_PROJECT_NAME",  "Demo Assistant"),
-        system_prompt = system_prompt,
-        gemini_model  = os.getenv(
-            "GEMINI_MODEL",
-            "gemini-2.5-flash-native-audio-preview-12-2025",
-        ),
-        voice_config  = VoiceConfig(
-            voice_name = os.getenv("DEMO_VOICE_NAME", "Kore"),
-        ),
-        vad_config            = VADConfig(mode="manual"),
-        tools                 = demo_tools,
-        session_ttl_seconds   = int(os.getenv("SESSION_TTL", "300")),
-        max_concurrent_sessions = int(os.getenv("MAX_SESSIONS", "100")),
-    )
-
-
-# ──────────────────────────────────────────────────────────────
 # Lifespan
 # ──────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start the SessionManager on boot, tear it down on shutdown."""
-    gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
+    """
+    Startup
+    ───────
+    1. Connect MongoDB (Motor async client)
+    2. Connect Redis
+    3. Ensure all collection indexes exist
+    4. Build Repositories bundle
+    5. Start SessionManager (spawns Gemini sessions)
+
+    Shutdown
+    ────────
+    1. Stop SessionManager (gracefully closes all active Gemini sessions)
+    2. Close Redis connection
+    3. Close MongoDB connection
+    """
+
+    # ── MongoDB ───────────────────────────────────────────────
+    mongo_uri = os.environ.get("MONGO_URI", "")
+    mongo_db  = os.environ.get("MONGO_DB_NAME", "livechat_dev")
+    if not mongo_uri:
+        log.warning("MONGO_URI is not set — database calls will fail.")
+
+    mongodb = MongoDB(uri=mongo_uri, db_name=mongo_db)
+    await ensure_indexes(mongodb)
+
+    # ── Redis ─────────────────────────────────────────────────
+    redis_url = os.environ.get("REDIS_URL")
+    redis     = RedisClient(url=redis_url)
+
+    # ── Repositories ──────────────────────────────────────────
+    repos = Repositories.create(mongodb, redis)
+
+    # ── Gemini + SessionManager ───────────────────────────────
+    gemini_api_key = os.environ.get("GEMINI_API_KEY")
     if not gemini_api_key:
         log.warning("GEMINI_API_KEY is not set — Gemini calls will fail.")
 
     gemini_client = genai.Client(api_key=gemini_api_key)
-
-    manager = SessionManager(gemini_client)
+    manager       = SessionManager(gemini_client)
     await manager.start()
 
-    # Attach shared state to the app so routers can access it via request.app.state
-    app.state.session_manager    = manager
-    app.state.demo_project_config = _build_demo_project()
+    # ── Attach to app.state ───────────────────────────────────
+    app.state.mongodb          = mongodb
+    app.state.redis            = redis
+    app.state.repos            = repos
+    app.state.session_manager  = manager
 
-    log.info("Application startup complete")
-    log.info("Demo project: %s", app.state.demo_project_config.name)
-    log.info(
-        "Demo tools: %s",
-        [t.name for t in app.state.demo_project_config.tools],
-    )
+    log.info("Application startup complete (db=%s)", mongo_db)
 
-    yield  # ← app is running here
+    yield  # ← application runs here
 
+    # ── Shutdown ──────────────────────────────────────────────
     log.info("Application shutting down")
     await manager.stop()
+    await redis.close()
+    mongodb.close()
     log.info("Application shutdown complete")
 
 
@@ -169,14 +123,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title       = "LiveChat API Platform",
-    version     = "0.2.0",       # Week 2-3 implementation
-    description = "Multi-tenant AI chatbot-as-a-service — core session engine",
+    version     = "0.5.0",
+    description = "Multi-tenant AI chatbot-as-a-service",
     lifespan    = lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins     = ["*"],   # Tighten to per-project origins in Week 8
+    allow_origins     = ["*"],   # tighten to per-project origins in Week 8
     allow_methods     = ["*"],
     allow_headers     = ["*"],
     allow_credentials = True,
@@ -186,22 +140,32 @@ app.add_middleware(
 app.include_router(chat_router)
 
 
-# ── Health & root endpoints (preserved from Week 1) ───────────
+# ──────────────────────────────────────────────────────────────
+# Core endpoints
+# ──────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root() -> dict:
     return {
         "service": "LiveChat API Platform",
-        "version": "0.2.0",
+        "version": "0.5.0",
         "status":  "ok",
     }
 
 
 @app.get("/health")
 async def health(request: Request) -> dict:
-    manager: SessionManager = request.app.state.session_manager
+    mongodb:  MongoDB          = request.app.state.mongodb
+    redis:    RedisClient      = request.app.state.redis
+    manager:  SessionManager   = request.app.state.session_manager
+
+    mongo_ok = await mongodb.ping()
+    redis_ok = await redis.ping()
+
     return {
-        "status":          "ok",
+        "status":          "ok" if (mongo_ok and redis_ok) else "degraded",
+        "mongodb":         "ok" if mongo_ok else "unreachable",
+        "redis":           "ok" if redis_ok else "unreachable",
         "active_sessions": await manager.active_session_count(),
         "session_ids":     await manager.get_active_session_ids(),
     }

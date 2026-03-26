@@ -1,12 +1,17 @@
 """
 core/schemas.py
 ───────────────
-Pydantic models that describe everything a Project needs to run a Gemini
-Live session.  No database or auth logic here — these are pure data shapes.
+Pydantic models used by the session engine at runtime.
 
-When the database layer arrives (Week 5-6) these same models will be
-populated by deserialising MongoDB documents.  Until then, a demo project
-is constructed from environment variables in main.py.
+These are PURE DATA SHAPES — no database or auth logic.
+The repository layer populates them by converting MongoDB documents.
+
+Relationship to core/documents.py
+──────────────────────────────────
+  documents.py  = full MongoDB document shapes (all DB fields)
+  schemas.py    = lean runtime shapes (only what Gemini runner needs)
+
+  ProjectDoc.to_project_config() bridges the two.
 """
 
 from __future__ import annotations
@@ -22,23 +27,20 @@ from pydantic import BaseModel, Field
 
 class ToolDefinition(BaseModel):
     """
-    Describes one function the Gemini model may call.
-
-    parameters  Raw JSON Schema object (OpenAPI 3.0 subset) — passed
-                verbatim to Gemini's function_declarations.
+    One function the Gemini model may call.
 
     execution_mode
-        "static"  → return static_response directly (good for demos / mocks)
+        "static"  → return static_response directly (demos / mocks)
         "webhook" → POST to webhook_url with the call arguments
     """
     name:            str
     description:     str
-    parameters:      dict[str, Any]          # raw JSON Schema
+    parameters:      dict[str, Any]                   # raw JSON Schema
     execution_mode:  Literal["static", "webhook"] = "static"
-    static_response: dict[str, Any] | None   = None
-    webhook_url:     str | None              = None
-    webhook_secret:  str | None              = None   # HMAC-SHA256 key
-    timeout_ms:      int                     = 5_000
+    static_response: dict[str, Any] | None         = None
+    webhook_url:     str | None                    = None
+    webhook_secret:  str | None                    = None  # HMAC-SHA256 key
+    timeout_ms:      int                           = 5_000
 
 
 # ──────────────────────────────────────────────────────────────
@@ -47,40 +49,38 @@ class ToolDefinition(BaseModel):
 
 class VoiceConfig(BaseModel):
     enabled:       bool = True
-    voice_name:    str  = "Kore"     # Gemini prebuilt voice
+    voice_name:    str  = "Kore"
     language_code: str  = "en-US"
 
 
 class VADConfig(BaseModel):
     """
-    Voice Activity Detection.
-
-    mode="manual"  → backend sends activity_start / activity_end driven by
-                     the client's voice_start / voice_end frames (our default).
-    mode="auto"    → Gemini's built-in VAD (disabled in manual mode).
+    mode="manual"  backend drives activity_start / activity_end signals.
+    mode="auto"    Gemini's built-in VAD (we keep manual as the default).
     """
     mode: Literal["auto", "manual"] = "manual"
 
 
 # ──────────────────────────────────────────────────────────────
-# Project config  (the core multi-tenant unit)
+# Project config  (the core multi-tenant runtime unit)
 # ──────────────────────────────────────────────────────────────
 
 class ProjectConfig(BaseModel):
     """
-    All configuration required to open and drive a Gemini Live session
-    for one customer project.
+    Everything the session engine needs to open and drive a Gemini session.
 
-    This will later be loaded from MongoDB by looking up the API key.
-    For now it is built from environment variables via `get_demo_config()`
-    in main.py.
+    tenant_id is included so the session runner can tag session records
+    correctly when it calls session_repo.close_session() on shutdown.
+    It is NOT passed to Gemini — it's purely for internal bookkeeping.
     """
     project_id:              str
+    tenant_id:               str  = ""   # populated from DB in Week 5+
     name:                    str
     system_prompt:           str
-    gemini_model:            str = "gemini-2.5-flash-native-audio-preview-12-2025"
+    gemini_model:            str  = "gemini-2.5-flash-native-audio-preview-12-2025"
     voice_config:            VoiceConfig  = Field(default_factory=VoiceConfig)
     vad_config:              VADConfig    = Field(default_factory=VADConfig)
     tools:                   list[ToolDefinition] = Field(default_factory=list)
     session_ttl_seconds:     int = 300
     max_concurrent_sessions: int = 100
+    rate_limit_rpm:          int = 60
