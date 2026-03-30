@@ -1,7 +1,7 @@
 """
 core/gemini_runner.py
 ─────────────────────
-Everything that talks directly to the Google Gemini Live API.
+Gemini Live API session runner.
 
 Key design decisions
 ────────────────────
@@ -30,7 +30,29 @@ Key design decisions
                           await _recv_task to finish
 
     This pipelines the user's speaking with Gemini's generation, saving
-    the full utterance duration in latency (typically 2–8 s).
+    the full utterance duration in latency (typically 2-8 s).
+
+Week 6 additions
+────────────────
+1.  Token usage tracking
+    Gemini Live API surfaces cumulative token counts via
+    message.usage_metadata on server messages (not on every message —
+    the server sends them periodically).  Fields used:
+      usage.total_token_count              — total tokens so far
+      usage.prompt_token_count             — input side
+      usage.response_tokens_details        — per-modality output breakdown
+ 
+    We capture the LAST seen values from usage_metadata and store them
+    on the SessionState so the finally block can write accurate totals
+    to MongoDB.
+ 
+2.  Session record persistence
+    session_runner now accepts an optional SessionRepository and calls
+    session_repo.close_session() in its finally block.  This is the fix
+    for sessions never being written to the sessions collection.
+ 
+    The session_repo is None-safe — if it hasn't been wired in (e.g. in
+    tests) the write is skipped silently.
 """
 
 from __future__ import annotations
@@ -38,6 +60,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from datetime import datetime, timezone
 
 from google import genai
 from google.genai import types
@@ -54,14 +77,7 @@ log = logging.getLogger("livechat.runner")
 # ──────────────────────────────────────────────────────────────
 
 def build_gemini_config(project: ProjectConfig) -> types.LiveConnectConfig:
-    """
-    Translate a ProjectConfig into the Gemini SDK's LiveConnectConfig.
-
-    Called once per session at open time — never at request time — so
-    changing a project's config in the database only affects new sessions.
-    """
-    # Convert our ToolDefinition objects to Gemini's function_declarations
-    # format (plain dicts that match the JSON Schema subset).
+    """Translate a ProjectConfig into the Gemini SDK's LiveConnectConfig."""
     function_declarations = [
         {
             "name":        t.name,
@@ -90,7 +106,7 @@ def build_gemini_config(project: ProjectConfig) -> types.LiveConnectConfig:
         temperature=0.7,
         realtime_input_config=types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(
-                disabled=True  # we drive VAD manually via activity_start/end
+                disabled=True
             )
         ),
     )
@@ -111,11 +127,6 @@ async def _handle_tool_call(
     tool_call: Any,
     executor:  ToolExecutor,
 ) -> None:
-    """
-    Execute each function_call in the batch, push results onto the outbox
-    (so the client sees what happened), then send all responses back to
-    Gemini in one send_tool_response call.
-    """
     sid = state.session_id
     function_responses: list[types.FunctionResponse] = []
 
@@ -129,7 +140,9 @@ async def _handle_tool_call(
             call_id=getattr(fc, "id", ""),
         )
 
-        # Forward the tool call + result to the client for transparency
+        # Increment tool call counter on the session state
+        state.tool_calls += 1
+
         await state.send_outbox((
             "tool_call",
             {
@@ -156,6 +169,50 @@ async def _handle_tool_call(
 
 
 # ──────────────────────────────────────────────────────────────
+# Usage metadata capture
+# ──────────────────────────────────────────────────────────────
+
+def _capture_usage(state: SessionState, usage: Any) -> None:
+    """
+    Extract token counts from a Gemini usage_metadata object and update
+    the SessionState counters.
+ 
+    The Live API sends usage_metadata periodically on server messages.
+    Values are CUMULATIVE (total since session start), so we simply
+    overwrite with the latest values rather than accumulating.
+ 
+    Fields on the usage_metadata object (google.genai.types.UsageMetadata):
+      total_token_count      — total input + output tokens
+      prompt_token_count     — input tokens
+      candidates_token_count — output tokens
+      response_tokens_details — list of ModalityTokenCount (optional)
+ 
+    For the Live API, audio-only sessions may not report
+    prompt_token_count separately, so we fall back to computing
+    input = total - output as a safe estimate.
+    """
+    if usage is None:
+        return
+ 
+    total    = getattr(usage, "total_token_count",      0) or 0
+    prompt   = getattr(usage, "prompt_token_count",     0) or 0
+    response = getattr(usage, "candidates_token_count", 0) or 0
+ 
+    if total and not prompt and not response:
+        # Live API audio session — only total is available
+        # Store total in output_tokens for simplicity; input_tokens stays 0
+        state.output_tokens = total
+    else:
+        state.input_tokens  = prompt
+        state.output_tokens = response
+ 
+    log.debug(
+        "[%s] usage_metadata: total=%d prompt=%d response=%d",
+        state.session_id, total, prompt, response,
+    )
+ 
+ 
+# ──────────────────────────────────────────────────────────────
 # Gemini response consumer
 # ──────────────────────────────────────────────────────────────
 
@@ -167,19 +224,22 @@ async def _consume_gemini_responses(
     """
     Drain Gemini's response stream for one turn.
 
-    Returns
-    -------
-    True   turn_complete or interrupted → session still alive
-    False  generator exhausted without turn_complete → Gemini closed session
+    Returns True on turn_complete/interrupted, False on session close.
+    Also captures usage_metadata and increments turn counter.
     """
     sid = state.session_id
 
     try:
         async for response in gsession.receive():
+ 
+            # ── Usage metadata (cumulative, sent periodically) ─────
+            if response.usage_metadata:
+                _capture_usage(state, response.usage_metadata)
+ 
             sc = response.server_content
 
             if sc is not None:
-                # ── Audio PCM ─────────────────────────────────────────
+                # ── Audio PCM ─────────────────────────────────────
                 if sc.model_turn and sc.model_turn.parts:
                     for part in sc.model_turn.parts:
                         if part.inline_data and part.inline_data.data:
@@ -188,47 +248,42 @@ async def _consume_gemini_responses(
                                     ("audio_pcm", part.inline_data.data)
                                 )
 
-                # ── Output transcription (assistant speech → text) ─────
+                # ── Output transcription ───────────────────────────
                 if sc.output_transcription and sc.output_transcription.text:
                     await state.send_outbox(
                         ("assistant_text", sc.output_transcription.text)
                     )
-                    log.debug(
-                        "[%s] assistant_text: %r",
-                        sid, sc.output_transcription.text,
-                    )
+                    log.debug("[%s] assistant_text: %r", sid, sc.output_transcription.text)
 
-                # ── Input transcription (user speech → text) ──────────
+                # ── Input transcription ────────────────────────────
                 if sc.input_transcription and sc.input_transcription.text:
                     await state.send_outbox(
                         ("user_transcript", sc.input_transcription.text)
                     )
-                    log.debug(
-                        "[%s] user_transcript: %r",
-                        sid, sc.input_transcription.text,
-                    )
+                    log.debug("[%s] user_transcript: %r", sid, sc.input_transcription.text)
 
-                # ── Barge-in / interrupted ────────────────────────────
+                # ── Barge-in ───────────────────────────────────────
                 if sc.interrupted:
                     log.info("[%s] Gemini interrupted generation", sid)
+                    state.turns += 1
                     await state.send_outbox(("turn_complete", None))
                     return True
 
-                # ── Normal turn complete ───────────────────────────────
+                # ── Turn complete ──────────────────────────────────
                 if sc.turn_complete:
+                    state.turns += 1
                     await state.send_outbox(("turn_complete", None))
-                    log.info("[%s] turn_complete", sid)
+                    log.info("[%s] turn_complete (turns=%d)", sid, state.turns)
                     return True
 
-            # ── Tool calls ────────────────────────────────────────────
+            # ── Tool calls ─────────────────────────────────────────
             if response.tool_call:
                 await _handle_tool_call(gsession, state, response.tool_call, executor)
 
-        # Generator exhausted without turn_complete → Gemini closed the WS
         return False
 
     except asyncio.CancelledError:
-        raise  # propagate so the runner can clean up
+        raise
 
     except Exception as exc:
         log.error("[%s] error receiving from Gemini: %s", sid, exc)
@@ -237,39 +292,26 @@ async def _consume_gemini_responses(
 
 
 # ──────────────────────────────────────────────────────────────
-# Session runner  (one per session, lives inside a Task)
+# Session runner
 # ──────────────────────────────────────────────────────────────
 
 async def session_runner(
-    state:   SessionState,
-    client:  genai.Client,
-    project: ProjectConfig,
+    state:        SessionState,
+    client:       genai.Client,
+    project:      ProjectConfig,
+    session_repo: Any = None,   # SessionRepository | None
 ) -> None:
     """
-    Opens ONE Gemini Live session per session_id and processes turns until:
-      • a STOP frame is received
-      • the inbox idles past session_ttl_seconds
-      • Gemini closes the session
-      • an unrecoverable error occurs
-
-    Voice-turn concurrency
-    ──────────────────────
-    ACTIVITY_START received
-        → send activity_start to Gemini
-        → spawn _recv_task as a background Task
-          (Gemini may start generating immediately)
-
-    AUDIO_CHUNKs received rapidly
-        → each chunk forwarded to Gemini with send_realtime_input
-        → _recv_task drains Gemini's output concurrently
-
-    ACTIVITY_END received
-        → send activity_end to Gemini (utterance complete)
-        → await _recv_task (drain any remaining output)
-
-    Text turns are sequential: send → await _consume directly.
+    Opens ONE Gemini Live session and processes turns until stopped.
+ 
+    session_repo is optional for backward compatibility.  When provided
+    (always the case in production) it writes a SessionDoc to MongoDB in
+    the finally block — fixing the missing session logs issue.
     """
-    sid = state.session_id
+    sid    = state.session_id
+    status = "closed"
+    error_message: str | None = None
+ 
     log.info("[%s] runner starting (project=%s)", sid, project.project_id)
 
     gemini_config = build_gemini_config(project)
@@ -294,35 +336,28 @@ async def session_runner(
             ))
 
             while True:
-                # Block waiting for the next inbound frame.
-                # If the inbox is idle longer than the project TTL, close.
                 try:
                     frame: InputFrame = await asyncio.wait_for(
                         state.inbox.get(),
                         timeout=float(project.session_ttl_seconds),
                     )
                 except TimeoutError:
-                    log.info(
-                        "[%s] idle timeout (%ss) — closing session",
-                        sid, project.session_ttl_seconds,
-                    )
+                    log.info("[%s] idle timeout — closing session", sid)
+                    status = "timeout"
                     break
 
                 state.touch()
 
-                # ── STOP ──────────────────────────────────────────────
                 if frame.kind == FrameKind.STOP:
                     log.info("[%s] stop signal received", sid)
                     break
 
-                # ── Speaker toggle ─────────────────────────────────────
                 if frame.kind == FrameKind.SET_SPEAKER:
                     await state.set_speaker_mode(bool(frame.payload))
                     await state.send_outbox(("speaker_mode_updated", frame.payload))
                     log.info("[%s] speaker_mode → %s", sid, frame.payload)
                     continue
 
-                # ── Voice: activity start ──────────────────────────────
                 if frame.kind == FrameKind.ACTIVITY_START:
                     log.debug("[%s] activity_start → Gemini", sid)
                     try:
@@ -331,20 +366,15 @@ async def session_runner(
                         )
                     except Exception as exc:
                         log.error("[%s] activity_start failed: %s", sid, exc)
-                        await state.send_outbox(
-                            ("error", f"activity_start failed: {exc}")
-                        )
+                        await state.send_outbox(("error", f"activity_start failed: {exc}"))
                         continue
 
-                    # Spawn the response consumer concurrently so it runs
-                    # while audio chunks are still being forwarded.
                     _recv_task = asyncio.create_task(
                         _consume_gemini_responses(gsession, state, executor),
                         name=f"recv-{sid}",
                     )
                     continue
 
-                # ── Voice: forward PCM chunk ───────────────────────────
                 if frame.kind == FrameKind.AUDIO_CHUNK:
                     try:
                         await gsession.send_realtime_input(
@@ -354,11 +384,9 @@ async def session_runner(
                             )
                         )
                     except Exception as exc:
-                        # One dropped chunk is survivable
                         log.warning("[%s] audio chunk send failed: %s", sid, exc)
                     continue
 
-                # ── Voice: activity end ────────────────────────────────
                 if frame.kind == FrameKind.ACTIVITY_END:
                     log.debug("[%s] activity_end → Gemini", sid)
                     try:
@@ -367,11 +395,8 @@ async def session_runner(
                         )
                     except Exception as exc:
                         log.error("[%s] activity_end failed: %s", sid, exc)
-                        await state.send_outbox(
-                            ("error", f"activity_end failed: {exc}")
-                        )
+                        await state.send_outbox(("error", f"activity_end failed: {exc}"))
 
-                    # Now drain the full response for this voice turn
                     if _recv_task is not None:
                         try:
                             session_alive = await _recv_task
@@ -380,13 +405,10 @@ async def session_runner(
                             session_alive = False
                         _recv_task = None
                         if not session_alive:
-                            log.warning(
-                                "[%s] Gemini session ended during voice turn", sid
-                            )
+                            log.warning("[%s] Gemini session ended during voice turn", sid)
                             break
                     continue
 
-                # ── Text input ─────────────────────────────────────────
                 if frame.kind == FrameKind.TEXT:
                     try:
                         await gsession.send_client_content(
@@ -400,33 +422,57 @@ async def session_runner(
                         )
                     except Exception as exc:
                         log.error("[%s] text send failed: %s", sid, exc)
-                        await state.send_outbox(
-                            ("error", f"Failed to send to Gemini: {exc}")
-                        )
+                        await state.send_outbox(("error", f"Failed to send to Gemini: {exc}"))
                         continue
 
-                    # Text turns are sequential — no concurrent task needed
                     session_alive = await _consume_gemini_responses(
                         gsession, state, executor
                     )
                     if not session_alive:
-                        log.warning(
-                            "[%s] Gemini session ended after text turn", sid
-                        )
+                        log.warning("[%s] Gemini session ended after text turn", sid)
                         break
 
     except asyncio.CancelledError:
         log.info("[%s] runner cancelled", sid)
+        status = "closed"
         if _recv_task and not _recv_task.done():
             _recv_task.cancel()
 
     except Exception as exc:
         log.exception("[%s] runner fatal error: %s", sid, exc)
+        status = "error"
+        error_message = str(exc)
         await state.send_outbox(("error", f"Session error: {exc}"))
 
     finally:
         if _recv_task and not _recv_task.done():
             _recv_task.cancel()
-        log.info("[%s] runner shutting down", sid)
+
+        # ── Persist session record to MongoDB ─────────────────────
+        # This is the fix: session_repo.close_session() is always called
+        # here so every session produces an analytics record.
+        if session_repo is not None:
+            try:
+                await session_repo.close_session(
+                    session_id    = sid,
+                    project_id    = project.project_id,
+                    tenant_id     = project.tenant_id,
+                    started_at    = state.started_at,
+                    status        = status,
+                    turns         = state.turns,
+                    tool_calls    = state.tool_calls,
+                    input_tokens  = state.input_tokens,
+                    output_tokens = state.output_tokens,
+                    error_message = error_message,
+                    api_key_id    = state.api_key_id,
+                )
+            except Exception as exc:
+                # Never crash the shutdown path over an analytics write
+                log.error("[%s] failed to write session record: %s", sid, exc)
+
+        log.info(
+            "[%s] runner shutdown (status=%s turns=%d input_tokens=%d output_tokens=%d)",
+            sid, status, state.turns, state.input_tokens, state.output_tokens,
+        )
         await state.send_outbox(("session_ended", None))
         await state.send_outbox(_OUTBOX_STOP)

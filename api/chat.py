@@ -10,6 +10,14 @@ Week 5 changes from Week 2-3
   • Per-key rate limiting enforced at handshake time (RedisClient)
   • WebSocket is closed with a clear 4xxx code on auth / rate-limit failure
     so clients can distinguish rejection reasons without polling
+    
+Week 6 changes from Week 5
+─────────────────────────────
+  • api_key is now RESOLVED against the database (APIKeyRepository)
+  • ProjectConfig is loaded via ProjectRepository (Redis-cached hot path)
+  • Per-key rate limiting enforced at handshake time (RedisClient)
+  • WebSocket is closed with a clear 4xxx code on auth / rate-limit failure
+    so clients can distinguish rejection reasons without polling
 
 Connection URL
 ──────────────
@@ -50,10 +58,9 @@ router = APIRouter()
 async def _resolve_project(
     ws:      WebSocket,
     api_key: str | None,
-) -> ProjectConfig | None:
+) -> tuple[ProjectConfig, str] | None:
     """
-    Validate the API key and return the resolved ProjectConfig.
-
+    Validate the API key and return (ProjectConfig, key_id).
     Returns None and closes the WebSocket (with an explanatory code) if
     anything fails.  Callers must return immediately on None.
     """
@@ -98,7 +105,7 @@ async def _resolve_project(
         await ws.close(code=4002, reason="Project not found or inactive.")
         return None
 
-    return config
+    return config, key_doc.id
 
 
 # ──────────────────────────────────────────────────────────────
@@ -311,10 +318,11 @@ async def ws_chat(
     await ws.accept()
 
     # ── Resolve project from API key ───────────────────────────
-    project = await _resolve_project(ws, api_key)
-    if project is None:
+    resolved = await _resolve_project(ws, api_key)
+    if resolved is None:
         return  # WebSocket already closed with a 4xxx code
 
+    project, api_key_id = resolved
     sid     = session_id or str(uuid.uuid4())
     manager: SessionManager = ws.app.state.session_manager
 
@@ -323,7 +331,7 @@ async def ws_chat(
         sid, project.project_id, project.tenant_id,
     )
 
-    state = await manager.get_or_create(sid, project)
+    state = await manager.get_or_create(sid, project, api_key_id=api_key_id)
 
     try:
         await asyncio.gather(

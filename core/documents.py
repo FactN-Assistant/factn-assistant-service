@@ -37,6 +37,11 @@ both field aliases (_id) and Python names (id) work during construction.
 When writing to MongoDB use .to_mongo() which renames `id` → `_id`.
 When reading from MongoDB pass the raw dict directly — Motor returns `_id`
 and populate_by_name allows that via the Field(alias="_id") pattern.
+
+Week 6 additions
+────────────────
+  SessionDoc  — added input_tokens, output_tokens fields
+  AuthTokenDoc — new: refresh token store for JWT auth (Week 6)
 """
 
 from __future__ import annotations
@@ -53,7 +58,6 @@ from .schemas import ProjectConfig, ToolDefinition, VoiceConfig, VADConfig
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
-
 def _new_id() -> str:
     return str(uuid.uuid4())
 
@@ -63,28 +67,19 @@ def _new_id() -> str:
 # ──────────────────────────────────────────────────────────────
 
 class TenantDoc(BaseModel):
-    """
-    One customer organisation.
-
-    password_hash   argon2 hash — added in Week 6 (auth).  Stored as empty
-                    string here so the schema is stable from Week 5 onward.
-    plan            billing plan — enforces session / token limits.
-    """
     model_config = ConfigDict(populate_by_name=True)
 
     id:             str      = Field(default_factory=_new_id, alias="_id")
     name:           str
     email:          str
-    password_hash:  str      = ""          # populated in Week 6
+    password_hash:  str      = ""
     plan:           Literal["free", "starter", "pro", "enterprise"] = "free"
     created_at:     datetime = Field(default_factory=_now)
     updated_at:     datetime = Field(default_factory=_now)
     is_active:      bool     = True
 
     def to_mongo(self) -> dict[str, Any]:
-        """Return a dict suitable for Motor insert/replace operations."""
-        d = self.model_dump(by_alias=True)
-        return d
+        return self.model_dump(by_alias=True)
 
     @classmethod
     def from_mongo(cls, doc: dict[str, Any]) -> "TenantDoc":
@@ -96,15 +91,6 @@ class TenantDoc(BaseModel):
 # ──────────────────────────────────────────────────────────────
 
 class ProjectDoc(BaseModel):
-    """
-    One chatbot project belonging to a tenant.
-
-    tools            list of ToolDefinition — stored as plain dicts in Mongo,
-                     deserialized back to ToolDefinition objects by from_mongo().
-    webhook_url      customer's HTTPS endpoint for webhook-mode tools.
-    webhook_secret   HMAC-SHA256 signing key for outbound webhook calls.
-    allowed_origins  CORS whitelist — enforced at WS upgrade (Week 8).
-    """
     model_config = ConfigDict(populate_by_name=True)
 
     id:                      str      = Field(default_factory=_new_id, alias="_id")
@@ -121,7 +107,7 @@ class ProjectDoc(BaseModel):
     allowed_origins:         list[str]    = Field(default_factory=list)
     session_ttl_seconds:     int          = 300
     max_concurrent_sessions: int          = 10
-    rate_limit_rpm:          int          = 60   # requests per minute per API key
+    rate_limit_rpm:          int          = 60
     created_at:              datetime     = Field(default_factory=_now)
     updated_at:              datetime     = Field(default_factory=_now)
     is_active:               bool         = True
@@ -134,13 +120,6 @@ class ProjectDoc(BaseModel):
         return cls.model_validate(doc)
 
     def to_project_config(self) -> ProjectConfig:
-        """
-        Convert to the runtime ProjectConfig used by the session engine.
-
-        This is the bridge between the database world and the Gemini runner.
-        Called by ProjectRepository.get_config_by_api_key() — which is the
-        hot path every WebSocket connection takes.
-        """
         return ProjectConfig(
             project_id              = self.id,
             tenant_id               = self.tenant_id,
@@ -152,6 +131,7 @@ class ProjectDoc(BaseModel):
             tools                   = self.tools,
             session_ttl_seconds     = self.session_ttl_seconds,
             max_concurrent_sessions = self.max_concurrent_sessions,
+            rate_limit_rpm          = self.rate_limit_rpm,
         )
 
 
@@ -160,31 +140,21 @@ class ProjectDoc(BaseModel):
 # ──────────────────────────────────────────────────────────────
 
 class APIKeyDoc(BaseModel):
-    """
-    An API key granting access to one project.
-
-    key_hash    argon2 hash of the full key — the only form stored in DB.
-                The full key is returned ONCE at creation and never stored.
-    key_prefix  first 12 characters of the full key — safe to display in the
-                dashboard so users can identify which key is which.
-    key_type    "publishable" → client-side use, chat:connect permission only.
-                "secret"      → server-side use, full permissions.
-    """
     model_config = ConfigDict(populate_by_name=True)
 
-    id:           str      = Field(default_factory=_new_id, alias="_id")
-    project_id:   str
-    tenant_id:    str
-    label:        str      = "Default key"
-    key_prefix:   str      = ""   # e.g. "pk_live_xxxx" (first 12 chars)
-    key_hash:     str      = ""   # argon2 hash — populated by APIKeyRepository
-    key_type:     Literal["publishable", "secret"] = "publishable"
-    rate_limit_rpm: int    = 60
-    revoked:      bool     = False
-    revoked_at:   datetime | None = None
-    created_at:   datetime = Field(default_factory=_now)
-    last_used_at: datetime | None = None
-    expires_at:   datetime | None = None
+    id:             str      = Field(default_factory=_new_id, alias="_id")
+    project_id:     str
+    tenant_id:      str
+    label:          str      = "Default key"
+    key_prefix:     str      = ""
+    key_hash:       str      = ""
+    key_type:       Literal["publishable", "secret"] = "publishable"
+    rate_limit_rpm: int      = 60
+    revoked:        bool     = False
+    revoked_at:     datetime | None = None
+    created_at:     datetime = Field(default_factory=_now)
+    last_used_at:   datetime | None = None
+    expires_at:     datetime | None = None
 
     def to_mongo(self) -> dict[str, Any]:
         return self.model_dump(by_alias=True)
@@ -195,42 +165,80 @@ class APIKeyDoc(BaseModel):
 
     @property
     def is_valid(self) -> bool:
-        """Quick in-memory validity check (not a substitute for hash verification)."""
         if self.revoked:
             return False
         if self.expires_at and self.expires_at < _now():
             return False
         return True
 
-
 # ──────────────────────────────────────────────────────────────
-# Session
+# Session (append-only analytics record)
 # ──────────────────────────────────────────────────────────────
 
 class SessionDoc(BaseModel):
     """
-    Persisted record written when a Gemini session closes.
-
-    This is append-only — sessions are never updated after being written.
-    Analytics queries run against this collection.
+    Written once when a Gemini session closes.  Never updated.
+ 
+    Token fields
+    ────────────
+    input_tokens   accumulated from usage_metadata.prompt_token_count
+    output_tokens  accumulated from usage_metadata.candidates_token_count
+ 
+    The Gemini Live API reports these cumulatively via usage_metadata
+    on server messages.  We capture the LAST values before session close.
+    For audio-only sessions total_token_count may be the only value
+    available; in that case it is stored in output_tokens.
     """
     model_config = ConfigDict(populate_by_name=True)
 
-    id:                   str      = Field(alias="_id")   # == the session_id UUID
-    project_id:           str
-    tenant_id:            str
-    api_key_id:           str      = ""
-    status:               Literal["closed", "error", "timeout"] = "closed"
-    started_at:           datetime
-    ended_at:             datetime = Field(default_factory=_now)
-    duration_seconds:     float    = 0.0
-    turns:                int      = 0
-    tool_calls:           int      = 0
-    error_message:        str | None = None
-
+    id:               str      = Field(alias="_id")
+    project_id:       str
+    tenant_id:        str
+    api_key_id:       str      = ""
+    status:           Literal["closed", "error", "timeout"] = "closed"
+    started_at:       datetime
+    ended_at:         datetime = Field(default_factory=_now)
+    duration_seconds: float    = 0.0
+    turns:            int      = 0
+    tool_calls:       int      = 0
+    input_tokens:     int      = 0
+    output_tokens:    int      = 0
+    error_message:    str | None = None
+ 
     def to_mongo(self) -> dict[str, Any]:
         return self.model_dump(by_alias=True)
 
     @classmethod
     def from_mongo(cls, doc: dict[str, Any]) -> "SessionDoc":
+        return cls.model_validate(doc)
+    
+# ──────────────────────────────────────────────────────────────
+# Auth Token  (Week 6 — refresh token store)
+# ──────────────────────────────────────────────────────────────
+ 
+class AuthTokenDoc(BaseModel):
+    """
+    Persisted refresh token.
+ 
+    Stored in the auth_tokens collection with a TTL index on expires_at
+    so MongoDB auto-deletes expired tokens.  The token_hash is an
+    argon2 hash of the raw refresh token — same security model as API keys.
+ 
+    On logout or token rotation, the document is deleted explicitly
+    (doesn't wait for the TTL to expire).
+    """
+    model_config = ConfigDict(populate_by_name=True)
+ 
+    id:           str      = Field(default_factory=_new_id, alias="_id")
+    tenant_id:    str
+    token_hash:   str                # argon2 hash of raw refresh token
+    token_family: str      = ""      # rotation family — detect reuse attacks
+    created_at:   datetime = Field(default_factory=_now)
+    expires_at:   datetime           # TTL index on this field
+ 
+    def to_mongo(self) -> dict[str, Any]:
+        return self.model_dump(by_alias=True)
+ 
+    @classmethod
+    def from_mongo(cls, doc: dict[str, Any]) -> "AuthTokenDoc":
         return cls.model_validate(doc)

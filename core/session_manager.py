@@ -17,12 +17,22 @@ Each backend node has its own in-process SessionManager.  NGINX sticky
 sessions route WebSocket reconnections to the same node.  Cross-node
 events (interrupt, speaker toggle) will be delivered via Redis Pub/Sub
 in the scaling sprint.  For now a single node is assumed.
+
+Week 6 changes
+──────────────
+get_or_create() now accepts an optional session_repo argument (a
+SessionRepository instance).  It is threaded directly into session_runner
+so every session close writes a SessionDoc to MongoDB automatically.
+ 
+The session_repo is stored on the manager at construction time and passed
+to every new runner task — callers don't need to pass it per-session.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 from google import genai
 
@@ -32,16 +42,20 @@ from .session_state import FrameKind, InputFrame, SessionState
 
 log = logging.getLogger("livechat.session_manager")
 
-# Stale-session sweep interval (seconds)
 _CLEANUP_INTERVAL = 60
 
 
 class SessionManager:
-    def __init__(self, gemini_client: genai.Client) -> None:
-        self._client:   genai.Client           = gemini_client
-        self._sessions: dict[str, SessionState] = {}
-        self._lock:     asyncio.Lock            = asyncio.Lock()
-        self._cleanup_task: asyncio.Task | None = None
+    def __init__(
+        self,
+        gemini_client: genai.Client,
+        session_repo:  Any = None,   # SessionRepository | None
+    ) -> None:
+        self._client:       genai.Client            = gemini_client
+        self._session_repo: Any                     = session_repo
+        self._sessions:     dict[str, SessionState] = {}
+        self._lock:         asyncio.Lock            = asyncio.Lock()
+        self._cleanup_task: asyncio.Task | None     = None
 
     # ── Lifecycle ─────────────────────────────────────────────
 
@@ -73,12 +87,12 @@ class SessionManager:
         self,
         session_id: str,
         project:    ProjectConfig,
+        api_key_id: str = "",
     ) -> SessionState:
         """
         Return an existing session (resume) or open a fresh Gemini session.
-
-        Thread-safe: the lock ensures only one coroutine creates a session
-        for a given session_id even under concurrent reconnect storms.
+        api_key_id  stored on SessionState so the session record references
+                    which key opened this session (written on close).
         """
         async with self._lock:
             state = self._sessions.get(session_id)
@@ -88,27 +102,29 @@ class SessionManager:
                 return state
 
             state = SessionState(
-                session_id=session_id,
-                project_id=project.project_id,
+                session_id = session_id,
+                project_id = project.project_id,
+                api_key_id = api_key_id,
             )
             self._sessions[session_id] = state
 
-        # Spawn the runner outside the lock — it may take a moment to open
-        # the Gemini WebSocket and we don't want to hold the lock that long.
+        # Spawn runner outside the lock — Gemini WS open may take a moment.
         task = asyncio.create_task(
-            session_runner(state, self._client, project),
+            session_runner(
+                state        = state,
+                client       = self._client,
+                project      = project,
+                session_repo = self._session_repo,   # ← wired in here
+            ),
             name=f"runner-{session_id}",
         )
         state.worker_task = task
-
-        # Auto-remove from registry when the runner finishes
         task.add_done_callback(
             lambda _: asyncio.create_task(self._on_runner_done(session_id))
         )
 
         log.info(
-            "[%s] new session created (project=%s)",
-            session_id, project.project_id,
+            "[%s] new session created (project=%s)", session_id, project.project_id
         )
         return state
 
@@ -130,10 +146,6 @@ class SessionManager:
         log.info("[%s] session removed from registry", session_id)
 
     async def _terminate(self, session_id: str) -> None:
-        """
-        Gracefully shut down a session: signal the runner via STOP frame,
-        then cancel the task if it hasn't exited within a short grace period.
-        """
         async with self._lock:
             state = self._sessions.pop(session_id, None)
         if state is None:
@@ -145,7 +157,6 @@ class SessionManager:
             pass
 
         if state.worker_task and not state.worker_task.done():
-            # Give the task 2 s to handle the STOP frame before cancelling
             try:
                 await asyncio.wait_for(
                     asyncio.shield(state.worker_task), timeout=2.0
@@ -160,14 +171,12 @@ class SessionManager:
         log.info("[%s] session terminated", session_id)
 
     async def _cleanup_loop(self) -> None:
-        """Periodically sweep and terminate idle sessions."""
         while True:
             await asyncio.sleep(_CLEANUP_INTERVAL)
             async with self._lock:
                 stale = [
-                    sid
-                    for sid, s in self._sessions.items()
-                    if s.is_idle(300)  # fallback TTL — overridden per project in runner
+                    sid for sid, s in self._sessions.items()
+                    if s.is_idle(300)
                 ]
             for sid in stale:
                 log.info("[%s] cleaning up idle session", sid)

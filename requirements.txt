@@ -1,26 +1,28 @@
 # LiveChat API Platform — backend dependencies
 
-# Web framework
+# ── Web framework ──────────────────────────────────────────────
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 
-# Google Gemini Live API SDK
+# ── Google Gemini Live API SDK ─────────────────────────────────
 google-genai>=1.0.0
 
-# Database
-motor>=3.4.0              # async MongoDB driver (Motor wraps PyMongo)
-pymongo>=4.7.0            # Motor peer dependency + index constants
-redis[hiredis]>=5.0.0     # async Redis client; hiredis = fast C parser
+# ── Database ───────────────────────────────────────────────────
+# pymongo >= 4.10 ships AsyncMongoClient (replaces the deprecated Motor driver)
+pymongo[srv]>=4.10.0          # [srv] includes dnspython for Atlas SRV URIs
+redis[hiredis]>=5.0.0         # async Redis; hiredis = fast C parser
 
-# Security
-argon2-cffi>=23.1.0       # API key hashing (and later password hashing)
+# ── Security ───────────────────────────────────────────────────
+argon2-cffi>=23.1.0           # API key + password + refresh token hashing
+python-jose[cryptography]>=3.3.0  # JWT encode/decode (HS256)
+email-validator>=2.0.0        # Pydantic EmailStr validation
 
-# HTTP client
-httpx>=0.27.0             # async webhook calls in tool_executor
+# ── HTTP client ────────────────────────────────────────────────
+httpx>=0.27.0                 # async webhook calls in tool_executor
 
-# Data validation
+# ── Data validation ────────────────────────────────────────────
 pydantic>=2.0.0
 pydantic-settings>=2.0.0
 
-# Utilities
+# ── Utilities ──────────────────────────────────────────────────
 python-dotenv>=1.0.0

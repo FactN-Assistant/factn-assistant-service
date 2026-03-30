@@ -29,6 +29,9 @@ sessions
 
 All _id fields are UUID strings — no ObjectId.  This makes cross-service
 references trivial and avoids ObjectId serialisation headaches in Pydantic.
+
+This was migrated to PyMongo Async removing Motor due to the reason Motor is about to deprecate.
+PyMongo Async note: create_index is awaitable, same as Motor.
 """
 
 from __future__ import annotations
@@ -64,7 +67,6 @@ async def ensure_indexes(mongodb: MongoDB) -> None:
     )
 
     # ── api_keys ──────────────────────────────────────────────
-    # This is the HOTTEST index — every WebSocket handshake hits it.
     await mongodb.api_keys.create_index(
         [("key_hash", ASCENDING)],
         unique=True,
@@ -78,11 +80,10 @@ async def ensure_indexes(mongodb: MongoDB) -> None:
         [("tenant_id", ASCENDING)],
         name="api_keys_by_tenant",
     )
-    # Partial index: only index non-revoked keys for faster active-key scans
     await mongodb.api_keys.create_index(
-        [("key_hash", ASCENDING)],
+        [("key_prefix", ASCENDING)],
         partialFilterExpression={"revoked": False},
-        name="api_keys_active_hash",
+        name="api_keys_active_prefix",
     )
 
     # ── sessions ──────────────────────────────────────────────
@@ -99,4 +100,17 @@ async def ensure_indexes(mongodb: MongoDB) -> None:
         name="sessions_by_status",
     )
 
+    # ── auth_tokens (Week 6 — refresh token store) ────────────
+    # TTL index: documents auto-delete when expires_at is reached.
+    await mongodb.db["auth_tokens"].create_index(
+        [("expires_at", ASCENDING)],
+        expireAfterSeconds=0,
+        name="auth_tokens_ttl",
+    )
+    await mongodb.db["auth_tokens"].create_index(
+        [("token_hash", ASCENDING)],
+        unique=True,
+        name="auth_tokens_hash_unique",
+    )
+ 
     log.info("MongoDB indexes ensured")

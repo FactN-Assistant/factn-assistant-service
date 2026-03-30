@@ -32,20 +32,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 
+from core.auth import hash_password
 from db.indexes import ensure_indexes
 from db.mongo import MongoDB
 from db.redis_client import RedisClient
 from repositories import Repositories
 
-SEED_TENANT_NAME   = "Demo Tenant"
-SEED_TENANT_EMAIL  = "demo@example.com"
-SEED_PROJECT_NAME  = "Demo Assistant"
-SEED_SYSTEM_PROMPT = (
+SEED_EMAIL    = "admin@example.com"
+SEED_PASSWORD = "changeme123"       # change before sharing
+SEED_NAME     = "Demo Tenant"
+PROJECT_NAME  = "Demo Assistant"
+SYSTEM_PROMPT = (
     "You are a helpful, friendly assistant. "
-    "Keep answers concise and conversational. "
-    "You have access to tools — use them when relevant."
+    "Keep answers concise and conversational."
 )
-SEED_KEY_LABEL = "Dev test key"
 
 
 async def main() -> None:
@@ -60,12 +60,13 @@ async def main() -> None:
     await ensure_indexes(mongodb)
 
     # ── Tenant ────────────────────────────────────────────────
-    tenant = await repos.tenants.get_by_email(SEED_TENANT_EMAIL)
+    tenant = await repos.tenants.get_by_email(SEED_EMAIL)
     if tenant is None:
-        tenant = await repos.tenants.create(
-            name=SEED_TENANT_NAME, email=SEED_TENANT_EMAIL
-        )
+        tenant = await repos.tenants.create(name=SEED_NAME, email=SEED_EMAIL)
+        pwd_hash = hash_password(SEED_PASSWORD)
+        await repos.tenants.update_password_hash(tenant.id, pwd_hash)
         print(f"Created tenant:   {tenant.id}  ({tenant.email})")
+        print(f"  Login password: {SEED_PASSWORD}")
     else:
         print(f"Existing tenant:  {tenant.id}  ({tenant.email})")
 
@@ -73,9 +74,9 @@ async def main() -> None:
     projects = await repos.projects.list_for_tenant(tenant.id, limit=1)
     if not projects:
         project = await repos.projects.create(
-            tenant_id=tenant.id,
-            name=SEED_PROJECT_NAME,
-            system_prompt=SEED_SYSTEM_PROMPT,
+            tenant_id     = tenant.id,
+            name          = PROJECT_NAME,
+            system_prompt = SYSTEM_PROMPT,
         )
         print(f"Created project:  {project.id}  ({project.name})")
     else:
@@ -84,10 +85,10 @@ async def main() -> None:
 
     # ── API Key ───────────────────────────────────────────────
     key_doc, raw_key = await repos.api_keys.create(
-        project_id=project.id,
-        tenant_id=tenant.id,
-        label=SEED_KEY_LABEL,
-        key_type="publishable",
+        project_id = project.id,
+        tenant_id  = tenant.id,
+        label      = "Dev test key",
+        key_type   = "publishable",
     )
 
     print()
@@ -95,10 +96,10 @@ async def main() -> None:
     print("  API KEY (copy this — shown only once):")
     print(f"  {raw_key}")
     print("=" * 60)
-    print(f"\n  Key prefix:  {key_doc.key_prefix}")
-    print(f"  Key ID:      {key_doc.id}")
-    print(f"  Project ID:  {project.id}")
-    print("\nPaste the API key into test_client.html and connect.\n")
+    print(f"\n  Prefix:     {key_doc.key_prefix}")
+    print(f"  Project ID: {project.id}")
+    print(f"  Tenant ID:  {tenant.id}")
+    print("\nPaste the API key into test_client.html → API Key field.\n")
 
     await redis.close()
     mongodb.close()

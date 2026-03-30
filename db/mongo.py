@@ -1,34 +1,35 @@
 """
 db/mongo.py
 ───────────
-MongoDB connection management using Motor (async PyMongo driver).
+MongoDB connection using PyMongo's native async API.
 
-Pattern
-───────
-A single AsyncIOMotorClient is created at application startup (lifespan)
-and stored on app.state.  All repositories receive the MongoDB instance —
-they never create their own connections.
+Motor → PyMongo Async migration (Motor deprecated May 2025)
+────────────────────────────────────────────────────────────
+  Motor                         PyMongo Async
+  ──────────────────────────    ──────────────────────────────
+  from motor.motor_asyncio      from pymongo
+  import AsyncIOMotorClient     import AsyncMongoClient
+  AsyncIOMotorClient(uri)       AsyncMongoClient(uri)           ← same args
+  await col.find_one(...)       await col.find_one(...)         ← identical
+  cursor.to_list(0)             cursor.to_list(None)            ← 0 invalid!
+  async for doc in cursor:      async for doc in cursor:        ← identical
 
-Collections  (one database, four collections)
-─────────────────────────────────────────────
-  tenants    — customer organisation accounts
-  projects   — chatbot projects owned by tenants
-  api_keys   — API keys linked to projects
-  sessions   — session records written on session close
-
-See db/indexes.py for the index definitions that are applied on first boot.
+Key constraints:
+  • AsyncMongoClient does NOT accept an io_loop parameter.
+  • AsyncMongoClient is NOT thread-safe — one event loop only.
+    FastAPI's lifespan guarantees this.
+  • to_list(None) = unlimited; to_list(N) = at most N docs.
 """
 
 from __future__ import annotations
 
 import logging
 
-from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from pymongo import AsyncMongoClient
+from pymongo.asynchronous.database import AsyncDatabase
 
 log = logging.getLogger("livechat.db.mongo")
 
-# Collection name constants — import these everywhere instead of
-# hardcoding strings so a typo is a NameError, not a silent bug.
 COL_TENANTS  = "tenants"
 COL_PROJECTS = "projects"
 COL_API_KEYS = "api_keys"
@@ -37,25 +38,21 @@ COL_SESSIONS = "sessions"
 
 class MongoDB:
     """
-    Thin wrapper around the Motor client exposing typed collection accessors.
-    Instantiated once in lifespan and stored on app.state.
+    Thin wrapper around AsyncMongoClient exposing typed collection accessors.
+    Instantiated once in lifespan, stored on app.state.
     """
 
     def __init__(self, uri: str, db_name: str) -> None:
-        self._client: AsyncIOMotorClient = AsyncIOMotorClient(
+        self._client: AsyncMongoClient = AsyncMongoClient(
             uri,
-            # Keep the pool small for Atlas free tier (M0) which caps at 500
-            # concurrent connections.  Raise maxPoolSize to 50 on M10+.
-            maxPoolSize=10,
+            maxPoolSize=10,       # Atlas M0 free tier caps at 500 total
             minPoolSize=1,
             serverSelectionTimeoutMS=10_000,
             connectTimeoutMS=10_000,
             socketTimeoutMS=30_000,
         )
-        self._db: AsyncIOMotorDatabase = self._client[db_name]
-        log.info("MongoDB client created (db=%s)", db_name)
-
-    # ── Collection accessors ───────────────────────────────────
+        self._db: AsyncDatabase = self._client[db_name]
+        log.info("MongoDB (PyMongo Async) client created (db=%s)", db_name)
 
     @property
     def tenants(self):
@@ -74,14 +71,10 @@ class MongoDB:
         return self._db[COL_SESSIONS]
 
     @property
-    def db(self) -> AsyncIOMotorDatabase:
-        """Raw database — for index creation and admin ops."""
+    def db(self) -> AsyncDatabase:
         return self._db
 
-    # ── Lifecycle ──────────────────────────────────────────────
-
     async def ping(self) -> bool:
-        """Return True if Atlas is reachable.  Used in /health."""
         try:
             await self._client.admin.command("ping")
             return True

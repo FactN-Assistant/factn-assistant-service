@@ -18,6 +18,7 @@ from db.mongo import MongoDB
 from db.redis_client import RedisClient
 
 from .api_key_repo import APIKeyRepository
+from .auth_token_repo import AuthTokenRepository
 from .project_repo import ProjectRepository
 from .session_repo import SessionRepository
 from .tenant_repo import TenantRepository
@@ -25,16 +26,19 @@ from .tenant_repo import TenantRepository
 
 @dataclass(frozen=True)
 class Repositories:
-    tenants:  TenantRepository
-    projects: ProjectRepository
-    api_keys: APIKeyRepository
-    sessions: SessionRepository
+    tenants:     TenantRepository
+    projects:    ProjectRepository
+    api_keys:    APIKeyRepository
+    sessions:    SessionRepository
+    auth_tokens: AuthTokenRepository
 
     @classmethod
     def create(cls, mongodb: MongoDB, redis: RedisClient) -> "Repositories":
         return cls(
-            tenants  = TenantRepository(mongodb),
-            projects = ProjectRepository(mongodb, redis),
-            api_keys = APIKeyRepository(mongodb),
-            sessions = SessionRepository(mongodb),
+            tenants     = TenantRepository(mongodb),
+            projects    = ProjectRepository(mongodb, redis),
+            api_keys    = APIKeyRepository(mongodb),
+            sessions    = SessionRepository(mongodb),
+            auth_tokens = AuthTokenRepository(mongodb),
         )
+ 

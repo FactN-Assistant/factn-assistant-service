@@ -1,7 +1,7 @@
 """
 repositories/session_repo.py
 ─────────────────────────────
-SessionRepository — writes and queries the `sessions` collection.
+SessionRepository — append-only session record writes + analytics queries.
 
 Write pattern
 ─────────────
@@ -14,6 +14,14 @@ Read pattern
 ────────────
 Analytics queries:  list_for_project(), usage_summary().
 These are called from REST endpoints (Week 10) and the dashboard.
+
+PyMongo Async note
+──────────────────
+cursor.to_list() in PyMongo Async requires an explicit length argument.
+Use to_list(None) to retrieve all results (no hard limit).
+Use to_list(N) to cap at N documents.
+Never use to_list(0) — this is invalid in PyMongo Async (was valid in Motor).
+
 """
 
 from __future__ import annotations
@@ -31,8 +39,8 @@ class SessionRepository:
     def __init__(self, mongodb: MongoDB) -> None:
         self._col = mongodb.sessions
 
-    # ── Write (called by session runner on close) ─────────────
-
+    # ── Write ─────────────────────────────────────────────────
+    
     async def close_session(
         self,
         session_id:    str,
@@ -42,15 +50,17 @@ class SessionRepository:
         status:        str = "closed",
         turns:         int = 0,
         tool_calls:    int = 0,
+        input_tokens:  int = 0,
+        output_tokens: int = 0,
         error_message: str | None = None,
         api_key_id:    str = "",
     ) -> SessionDoc:
         """
-        Persist a session record on close.
-
-        Called from session_runner's finally block so it always runs —
-        even on unexpected errors.  Non-critical: if this write fails the
-        session still closed cleanly, we just lose the analytics record.
+        Persist a session record on close.  Always called from the
+        session_runner's finally block — runs even on error/cancel.
+ 
+        Non-critical: write failures are logged but never re-raised so
+        the session shutdown path is never blocked.
         """
         ended_at = datetime.now(timezone.utc)
         duration = (ended_at - started_at).total_seconds()
@@ -60,22 +70,24 @@ class SessionRepository:
             project_id       = project_id,
             tenant_id        = tenant_id,
             api_key_id       = api_key_id,
-            status           = status,         # type: ignore[arg-type]
+            status           = status,           # type: ignore[arg-type]
             started_at       = started_at,
             ended_at         = ended_at,
             duration_seconds = round(duration, 2),
             turns            = turns,
             tool_calls       = tool_calls,
+            input_tokens     = input_tokens,
+            output_tokens    = output_tokens,
             error_message    = error_message,
         )
         try:
             await self._col.insert_one(doc.to_mongo())
             log.info(
-                "Session record written: %s (status=%s turns=%d duration=%.1fs)",
-                session_id, status, turns, duration,
+                "Session record written: %s "
+                "(status=%s turns=%d input_tokens=%d output_tokens=%d duration=%.1fs)",
+                session_id, status, turns, input_tokens, output_tokens, duration,
             )
         except Exception as exc:
-            # Never crash the shutdown path over an analytics write
             log.error("Failed to write session record %s: %s", session_id, exc)
 
         return doc
@@ -88,6 +100,7 @@ class SessionRepository:
         limit:      int = 50,
         skip:       int = 0,
     ) -> list[SessionDoc]:
+        # to_list(None) = no limit cap; caller controls with .limit(N)
         cursor = (
             self._col.find({"project_id": project_id})
             .sort("started_at", -1)
@@ -109,10 +122,6 @@ class SessionRepository:
         project_id: str,
         since:      datetime,
     ) -> dict:
-        """
-        Aggregate basic usage metrics for a project since a given datetime.
-        Returns a plain dict — used by the /usage REST endpoint (Week 10).
-        """
         pipeline = [
             {"$match": {
                 "project_id": project_id,
@@ -124,19 +133,24 @@ class SessionRepository:
                 "total_turns":      {"$sum": "$turns"},
                 "total_tool_calls": {"$sum": "$tool_calls"},
                 "total_duration_s": {"$sum": "$duration_seconds"},
+                "total_input_tokens":  {"$sum": "$input_tokens"},
+                "total_output_tokens": {"$sum": "$output_tokens"},
                 "error_count":      {"$sum": {
                     "$cond": [{"$eq": ["$status", "error"]}, 1, 0]
                 }},
             }},
         ]
-        results = await self._col.aggregate(pipeline).to_list(length=1)
+        # PyMongo Async: to_list(None) replaces to_list(length=1) from Motor
+        results = await self._col.aggregate(pipeline).to_list(None)
         if not results:
             return {
-                "total_sessions":   0,
-                "total_turns":      0,
-                "total_tool_calls": 0,
-                "total_duration_s": 0.0,
-                "error_count":      0,
+                "total_sessions":      0,
+                "total_turns":         0,
+                "total_tool_calls":    0,
+                "total_duration_s":    0.0,
+                "total_input_tokens":  0,
+                "total_output_tokens": 0,
+                "error_count":         0,
             }
         r = results[0]
         r.pop("_id", None)
