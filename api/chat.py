@@ -22,63 +22,149 @@ Week 6 changes from Week 5
 Connection URL
 ──────────────
   wss://host/v1/chat?api_key=<key>[&session_id=<uuid>]
+  wss://host/v1/chat?token=<ephemeral>[&session_id=<uuid>]
+ 
+  Exactly one of api_key or token must be provided.
+  token is single-use — it is deleted from Redis on the first
+  successful WebSocket handshake.
 
 Close codes used
 ────────────────
-  4001  Missing or invalid API key
+  4001  Missing or invalid API key / token
   4002  Project not found or inactive
   4003  Rate limit exceeded
   4004  Max concurrent sessions reached for this project
+  4005  Ephemeral token already redeemed or expired
 """
 
 from __future__ import annotations
-
+ 
 import asyncio
 import json
 import logging
 import uuid
-
+ 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
-
+ 
 from core.schemas import ProjectConfig
 from core.session_manager import SessionManager
 from core.session_state import FrameKind, InputFrame, _OUTBOX_STOP
 from db.redis_client import RedisClient
 from repositories import Repositories
-
+ 
 log = logging.getLogger("livechat.ws")
-
+ 
 router = APIRouter()
-
-
+ 
+ 
 # ──────────────────────────────────────────────────────────────
 # Handshake — resolve project config from API key
 # ──────────────────────────────────────────────────────────────
-
+ 
 async def _resolve_project(
     ws:      WebSocket,
     api_key: str | None,
+    token:   str | None,
 ) -> tuple[ProjectConfig, str] | None:
     """
-    Validate the API key and return (ProjectConfig, key_id).
+    Validate credentials and return (ProjectConfig, api_key_id).
+ 
+    Accepts EITHER an api_key (long-lived, rate-limited) OR an ephemeral
+    token (single-use, short-lived).  Exactly one must be provided.
+ 
     Returns None and closes the WebSocket (with an explanatory code) if
     anything fails.  Callers must return immediately on None.
+ 
+    Credential paths
+    ────────────────
+    api_key path:  verify hash → rate-limit → load project config
+    token path:    redeem atomically → extract project_id + rate_limit_rpm
+                   → load project config from Redis cache (same as api_key path)
     """
-    repos:  Repositories = ws.app.state.repos
-    redis:  RedisClient  = ws.app.state.redis
-
-    # ── 1. Key provided? ──────────────────────────────────────
-    if not api_key:
-        await ws.close(code=4001, reason="Missing api_key query parameter.")
+    repos: Repositories = ws.app.state.repos
+    redis: RedisClient  = ws.app.state.redis
+ 
+    # ── 1. Exactly one credential required ────────────────────
+    if not api_key and not token:
+        await ws.close(
+            code=4001,
+            reason="Either api_key or token query parameter is required.",
+        )
         return None
-
+ 
+    if api_key and token:
+        # Prefer token when both are provided — token is more specific
+        log.debug("Both api_key and token provided — using token")
+        api_key = None
+ 
+    # ══════════════════════════════════════════════════════════
+    # PATH A: Ephemeral token
+    # ══════════════════════════════════════════════════════════
+    if token:
+        # Atomically read-and-delete the token from Redis.
+        # If two connections race, only one gets the payload — the other
+        # receives None and is rejected with 4005.
+        payload = await redis.redeem_ephemeral_token(token)
+ 
+        if payload is None:
+            await ws.close(
+                code=4005,
+                reason="Ephemeral token is invalid, already redeemed, or expired.",
+            )
+            return None
+ 
+        project_id     = payload["project_id"]
+        tenant_id      = payload["tenant_id"]
+        api_key_id     = payload["api_key_id"]
+        rate_limit_rpm = payload.get("rate_limit_rpm", 60)
+ 
+        # Rate-limit check using the token's project_id as the key prefix
+        # (tokens don't have a key_prefix, so we use the project_id)
+        allowed, count = await redis.check_and_increment_rate_limit(
+            key_prefix = f"tok:{project_id}",
+            limit      = rate_limit_rpm,
+            window_s   = 60,
+        )
+        if not allowed:
+            log.warning(
+                "Rate limit exceeded for token: project=%s count=%d limit=%d",
+                project_id, count, rate_limit_rpm,
+            )
+            await ws.close(
+                code=4003,
+                reason=f"Rate limit exceeded ({rate_limit_rpm} req/min).",
+            )
+            return None
+ 
+        # Load project config from Redis cache (same path as api_key)
+        # We construct a minimal object that get_config_for_key() needs.
+        # Rather than duplicate the cache lookup logic, use a lightweight
+        # shim that matches the APIKeyDoc interface.
+        config = await repos.projects.get_config_by_id(
+            project_id = project_id,
+            tenant_id  = tenant_id,
+        )
+        if config is None:
+            await ws.close(code=4002, reason="Project not found or inactive.")
+            return None
+ 
+        log.info(
+            "Token auth: project=%s api_key_id=%s",
+            project_id, api_key_id,
+        )
+        return config, api_key_id
+ 
+    # ══════════════════════════════════════════════════════════
+    # PATH B: Long-lived API key
+    # ══════════════════════════════════════════════════════════
+ 
     # ── 2. Lookup key in DB ───────────────────────────────────
     key_doc = await repos.api_keys.get_by_raw_key(api_key)
     if key_doc is None:
-        log.warning("Invalid or revoked API key: prefix=%s", api_key[:12])
+        log.warning("Invalid or revoked API key: prefix=%s", (api_key or "")[:12])
         await ws.close(code=4001, reason="Invalid or revoked API key.")
         return None
-
+ 
     # ── 3. Rate limit check ───────────────────────────────────
     allowed, count = await redis.check_and_increment_rate_limit(
         key_prefix = key_doc.key_prefix,
@@ -95,7 +181,7 @@ async def _resolve_project(
             reason=f"Rate limit exceeded ({key_doc.rate_limit_rpm} req/min).",
         )
         return None
-
+ 
     # ── 4. Load project config (Redis-cached) ─────────────────
     config = await repos.projects.get_config_for_key(key_doc)
     if config is None:
@@ -104,14 +190,14 @@ async def _resolve_project(
         )
         await ws.close(code=4002, reason="Project not found or inactive.")
         return None
-
+ 
     return config, key_doc.id
-
-
+ 
+ 
 # ──────────────────────────────────────────────────────────────
 # Forward loop  (outbox → WebSocket)
 # ──────────────────────────────────────────────────────────────
-
+ 
 async def _forward_loop(ws: WebSocket, state) -> None:
     """
     Drain the session outbox and write frames to the client WebSocket.
@@ -119,81 +205,81 @@ async def _forward_loop(ws: WebSocket, state) -> None:
     """
     while True:
         item = await state.outbox.get()
-
+ 
         if item is _OUTBOX_STOP:
             break
-
+ 
         kind, payload = item
-
+ 
         try:
             match kind:
                 case "audio_pcm":
                     await ws.send_bytes(payload)
-
+ 
                 case "session_ready":
                     await ws.send_text(
                         json.dumps({"type": "session_ready", **payload})
                     )
-
+ 
                 case "assistant_text":
                     await ws.send_text(
                         json.dumps({"type": "assistant_text", "text": payload})
                     )
-
+ 
                 case "user_transcript":
                     await ws.send_text(
                         json.dumps({"type": "user_transcript", "text": payload})
                     )
-
+ 
                 case "tool_call":
                     await ws.send_text(
                         json.dumps({"type": "tool_call", **payload})
                     )
-
+ 
                 case "turn_complete":
                     await ws.send_text(json.dumps({"type": "turn_complete"}))
-
+ 
                 case "speaker_mode_updated":
                     await ws.send_text(
                         json.dumps({"type": "speaker_mode_updated", "enabled": payload})
                     )
-
+ 
                 case "error":
                     await ws.send_text(
                         json.dumps({"type": "error", "message": payload})
                     )
-
+ 
                 case "session_ended":
                     await ws.send_text(json.dumps({"type": "session_ended"}))
-
+ 
                 case _:
                     log.warning(
                         "[%s] forward_loop: unknown frame kind %r",
                         state.session_id, kind,
                     )
-
+ 
         except WebSocketDisconnect:
             log.info("[%s] WebSocket disconnected during send", state.session_id)
             break
         except Exception as exc:
             log.error("[%s] forward_loop send error: %s", state.session_id, exc)
             break
-
-
+ 
+ 
 # ──────────────────────────────────────────────────────────────
 # Receive loop  (WebSocket → inbox)
 # ──────────────────────────────────────────────────────────────
-
+ 
 async def _receive_loop(ws: WebSocket, state) -> None:
     """
     Read frames from the client WebSocket and push InputFrames onto inbox.
-
+ 
     Binary frames  → AUDIO_CHUNK (only while voice_active)
     Text frames    → parsed JSON control messages
     """
     sid          = state.session_id
     voice_active = False
-
+ 
     try:
         while True:
             try:
@@ -201,7 +287,7 @@ async def _receive_loop(ws: WebSocket, state) -> None:
             except WebSocketDisconnect:
                 log.info("[%s] client disconnected", sid)
                 return
-
+ 
             # ── Binary: raw PCM ────────────────────────────────
             if "bytes" in message and message["bytes"]:
                 if not voice_active:
@@ -214,12 +300,12 @@ async def _receive_loop(ws: WebSocket, state) -> None:
                 except asyncio.QueueFull:
                     log.warning("[%s] inbox full — dropping audio chunk", sid)
                 continue
-
+ 
             # ── Text: JSON control messages ────────────────────
             raw_text = message.get("text", "")
             if not raw_text:
                 continue
-
+ 
             try:
                 payload = json.loads(raw_text)
             except json.JSONDecodeError:
@@ -228,11 +314,11 @@ async def _receive_loop(ws: WebSocket, state) -> None:
                     "message": "Invalid JSON — could not parse message.",
                 }))
                 continue
-
+ 
             msg_type = payload.get("type")
-
+ 
             match msg_type:
-
+ 
                 case "text_input":
                     text = (payload.get("text") or "").strip()
                     if not text:
@@ -242,7 +328,7 @@ async def _receive_loop(ws: WebSocket, state) -> None:
                         state.inbox.put_nowait(InputFrame(FrameKind.TEXT, text))
                     except asyncio.QueueFull:
                         await _send_busy(ws)
-
+ 
                 case "voice_start":
                     if voice_active:
                         log.debug("[%s] voice_start while already active — resetting", sid)
@@ -252,7 +338,7 @@ async def _receive_loop(ws: WebSocket, state) -> None:
                         state.inbox.put_nowait(InputFrame(FrameKind.ACTIVITY_START, None))
                     except asyncio.QueueFull:
                         await _send_busy(ws)
-
+ 
                 case "voice_end":
                     if not voice_active:
                         log.debug("[%s] voice_end without active turn — ignored", sid)
@@ -263,31 +349,31 @@ async def _receive_loop(ws: WebSocket, state) -> None:
                         state.inbox.put_nowait(InputFrame(FrameKind.ACTIVITY_END, None))
                     except asyncio.QueueFull:
                         await _send_busy(ws)
-
+ 
                 case "set_speaker":
                     enabled = bool(payload.get("enabled", False))
                     try:
                         state.inbox.put_nowait(InputFrame(FrameKind.SET_SPEAKER, enabled))
                     except asyncio.QueueFull:
                         await _send_busy(ws)
-
+ 
                 case "interrupt":
                     voice_active = False
                     log.debug("[%s] interrupt", sid)
-
+ 
                 case "ping":
                     await ws.send_text(json.dumps({"type": "pong"}))
-
+ 
                 case _:
                     await ws.send_text(json.dumps({
                         "type":    "error",
                         "message": f"Unknown message type: {msg_type!r}",
                     }))
-
+ 
     except Exception as exc:
         log.error("[%s] receive_loop unexpected error: %s", sid, exc)
-
-
+ 
+ 
 async def _send_busy(ws: WebSocket) -> None:
     try:
         await ws.send_text(json.dumps({
@@ -296,43 +382,46 @@ async def _send_busy(ws: WebSocket) -> None:
         }))
     except Exception:
         pass
-
-
+ 
+ 
 # ──────────────────────────────────────────────────────────────
 # WebSocket endpoint
 # ──────────────────────────────────────────────────────────────
-
+ 
 @router.websocket("/v1/chat")
 async def ws_chat(
     ws:         WebSocket,
     api_key:    str | None = Query(default=None, alias="api_key"),
+    token:      str | None = Query(default=None, alias="token"),
     session_id: str | None = Query(default=None, alias="session_id"),
 ) -> None:
     """
     Unified chat WebSocket endpoint.
-
-    api_key     Identifies the project.  Validated against DB; rate-limited.
+ 
+    api_key     Long-lived publishable key.  Validated against DB; rate-limited.
+    token       Single-use ephemeral token.  Redeemed atomically from Redis.
     session_id  Optional UUID to resume an existing Gemini session.
-                Omit (or pass a new UUID) for a brand-new conversation.
+ 
+    Exactly one of api_key or token must be provided.
     """
     await ws.accept()
-
-    # ── Resolve project from API key ───────────────────────────
-    resolved = await _resolve_project(ws, api_key)
+ 
+    # ── Resolve project from credentials ──────────────────────
+    resolved = await _resolve_project(ws, api_key, token)
     if resolved is None:
         return  # WebSocket already closed with a 4xxx code
-
+ 
     project, api_key_id = resolved
     sid     = session_id or str(uuid.uuid4())
     manager: SessionManager = ws.app.state.session_manager
-
+ 
     log.info(
         "[%s] WebSocket connected (project=%s tenant=%s)",
         sid, project.project_id, project.tenant_id,
     )
-
+ 
     state = await manager.get_or_create(sid, project, api_key_id=api_key_id)
-
+ 
     try:
         await asyncio.gather(
             _receive_loop(ws, state),

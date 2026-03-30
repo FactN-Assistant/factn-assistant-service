@@ -26,6 +26,11 @@ Week 7 changes from Week 6
 ───────────────────────────
   • Projects router registered (full CRUD + tool CRUD + test endpoint)
   • Version bumped to 0.7.0
+  
+Week 8 changes from Week 7
+───────────────────────────
+  • Tokens router registered (POST /v1/tokens, POST /v1/tokens/rotate)
+  • Version bumped to 0.8.0
 
 Running locally
 ───────────────
@@ -46,6 +51,7 @@ from fastapi.requests import Request
 from google import genai
 
 from api.auth import router as auth_router
+from api.tokens import router as tokens_router
 from api.projects import router as projects_router
 from api.chat import router as chat_router
 from api.keys import router as keys_router
@@ -139,9 +145,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title       = "LiveChat API Platform",
-    version     = "0.7.0",
-    description = "Multi-tenant AI chatbot-as-a-service",
+    title       = "FactN Assistant",
+    version     = "5.8.0",
+    description = "Multi-tenant AI chatbot-as-a-service With Google Gemini Live",
     lifespan    = lifespan,
 )
 
@@ -156,13 +162,14 @@ app.add_middleware(
 # ── Routers ───────────────────────────────────────────────────
 app.include_router(auth_router)
 app.include_router(projects_router)
+app.include_router(tokens_router)
 app.include_router(chat_router)
 app.include_router(keys_router)
 
 
 @app.get("/")
 async def root() -> dict:
-    return {"service": "LiveChat API Platform", "version": "0.7.0", "status": "ok"}
+    return {"service": app.title, "version": app.version, "status": "ok"}
 
 
 @app.get("/health")
