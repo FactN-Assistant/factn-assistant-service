@@ -214,7 +214,6 @@ async def login(
            the email exists or just the password is wrong)
       429  rate limit exceeded (10 attempts/min per IP)
     """
-    print("test: ", request.body)
     await _check_login_rate_limit(request)
 
     repos: Repositories = request.app.state.repos
