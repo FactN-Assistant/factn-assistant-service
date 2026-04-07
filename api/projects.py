@@ -54,11 +54,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field, field_validator, model_validator
+from datetime import datetime, timezone, timedelta
 
 from core.documents import ProjectDoc, TenantDoc
 from core.gemini_runner import build_gemini_config
 from core.schemas import (
-    ProjectConfig,
     ToolDefinition,
     VADConfig,
     VoiceConfig,
@@ -829,4 +829,207 @@ def _tool_to_response(tool: ToolDefinition) -> ToolResponse:
         static_response = tool.static_response,
         webhook_url     = tool.webhook_url,
         timeout_ms      = tool.timeout_ms,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# SESSION ANALYTICS  (Week 10, Task 3)
+# ══════════════════════════════════════════════════════════════
+
+class SessionSummaryResponse(BaseModel):
+    """
+    Single session record returned by GET /v1/projects/{id}/sessions.
+    Mirrors the SessionDoc fields that are safe to expose via the API.
+    """
+    session_id:       str
+    project_id:       str
+    status:           str
+    started_at:       str
+    ended_at:         str
+    duration_seconds: float
+    turns:            int
+    tool_calls:       int
+    input_tokens:     int
+    output_tokens:    int
+    api_key_id:       str
+    error_message:    str | None
+
+
+class SessionListResponse(BaseModel):
+    sessions: list[SessionSummaryResponse]
+    total:    int
+    limit:    int
+    skip:     int
+
+
+class UsageSummaryResponse(BaseModel):
+    """
+    Aggregated usage metrics for a project over a time window.
+    Returned by GET /v1/projects/{id}/usage.
+    """
+    project_id:           str
+    since:                str   # ISO8601 — start of the reporting window
+    until:                str   # ISO8601 — end of the reporting window (now)
+    total_sessions:       int
+    total_turns:          int
+    total_tool_calls:     int
+    total_duration_s:     float
+    avg_duration_s:       float
+    total_input_tokens:   int
+    total_output_tokens:  int
+    total_tokens:         int
+    error_count:          int
+    error_rate_pct:       float
+
+
+@router.get("/{project_id}/sessions")
+async def list_sessions(
+    project_id: str,
+    request:    Request,
+    limit:      int = 50,
+    skip:       int = 0,
+    status:     str | None = None,
+    tenant:     TenantDoc = Depends(get_current_tenant),
+) -> SessionListResponse:
+    """
+    List session records for a project, newest first.
+
+    Query parameters
+    ────────────────
+    limit   max sessions to return (1–200, default 50)
+    skip    offset for pagination
+    status  filter by status: "closed" | "error" | "timeout"
+            omit to return all statuses
+
+    Each session record includes start/end times, duration, turn count,
+    tool call count, and token usage — suitable for a session history table
+    in the dashboard.
+    """
+    repos: Repositories = request.app.state.repos
+
+    # Verify project belongs to this tenant
+    doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
+    _get_project_or_404(doc, project_id)
+
+    limit = max(1, min(limit, 200))
+
+    sessions = await repos.sessions.list_for_project(
+        project_id = project_id,
+        limit      = limit,
+        skip       = skip,
+        status     = status,
+    )
+
+    return SessionListResponse(
+        sessions = [
+            SessionSummaryResponse(
+                session_id       = s.id,
+                project_id       = s.project_id,
+                status           = s.status,
+                started_at       = s.started_at.isoformat(),
+                ended_at         = s.ended_at.isoformat(),
+                duration_seconds = s.duration_seconds,
+                turns            = s.turns,
+                tool_calls       = s.tool_calls,
+                input_tokens     = s.input_tokens,
+                output_tokens    = s.output_tokens,
+                api_key_id       = s.api_key_id,
+                error_message    = s.error_message,
+            )
+            for s in sessions
+        ],
+        total = len(sessions),
+        limit = limit,
+        skip  = skip,
+    )
+
+
+@router.get("/{project_id}/sessions/{session_id_path}")
+async def get_session(
+    project_id:       str,
+    session_id_path:  str,
+    request:          Request,
+    tenant:           TenantDoc = Depends(get_current_tenant),
+) -> SessionSummaryResponse:
+    """Get a single session record by its ID."""
+    repos: Repositories = request.app.state.repos
+
+    doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
+    _get_project_or_404(doc, project_id)
+
+    session = await repos.sessions.get_by_id(session_id_path, project_id)
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id_path}' not found.",
+        )
+
+    return SessionSummaryResponse(
+        session_id       = session.id,
+        project_id       = session.project_id,
+        status           = session.status,
+        started_at       = session.started_at.isoformat(),
+        ended_at         = session.ended_at.isoformat(),
+        duration_seconds = session.duration_seconds,
+        turns            = session.turns,
+        tool_calls       = session.tool_calls,
+        input_tokens     = session.input_tokens,
+        output_tokens    = session.output_tokens,
+        api_key_id       = session.api_key_id,
+        error_message    = session.error_message,
+    )
+
+
+@router.get("/{project_id}/usage")
+async def get_usage(
+    project_id: str,
+    request:    Request,
+    days:       int = 30,
+    tenant:     TenantDoc = Depends(get_current_tenant),
+) -> UsageSummaryResponse:
+    """
+    Aggregate usage metrics for a project over the last N days.
+
+    Query parameters
+    ────────────────
+    days   reporting window in days (1–365, default 30)
+
+    Returns totals and averages for: sessions, turns, tool calls, duration,
+    and token consumption (input + output). Suitable for the analytics tab
+    in the dashboard.
+    """
+    repos: Repositories = request.app.state.repos
+
+    doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
+    _get_project_or_404(doc, project_id)
+
+    days  = max(1, min(days, 365))
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    until = datetime.now(timezone.utc)
+
+    summary = await repos.sessions.usage_summary(
+        project_id = project_id,
+        since      = since,
+    )
+
+    total_sessions = summary.get("total_sessions", 0)
+    total_dur      = summary.get("total_duration_s", 0.0)
+    error_count    = summary.get("error_count", 0)
+    total_in       = summary.get("total_input_tokens", 0)
+    total_out      = summary.get("total_output_tokens", 0)
+
+    return UsageSummaryResponse(
+        project_id          = project_id,
+        since               = since.isoformat(),
+        until               = until.isoformat(),
+        total_sessions      = total_sessions,
+        total_turns         = summary.get("total_turns", 0),
+        total_tool_calls    = summary.get("total_tool_calls", 0),
+        total_duration_s    = round(total_dur, 2),
+        avg_duration_s      = round(total_dur / total_sessions, 2) if total_sessions else 0.0,
+        total_input_tokens  = total_in,
+        total_output_tokens = total_out,
+        total_tokens        = total_in + total_out,
+        error_count         = error_count,
+        error_rate_pct      = round(error_count / total_sessions * 100, 1) if total_sessions else 0.0,
     )

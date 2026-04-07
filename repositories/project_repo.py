@@ -76,6 +76,39 @@ class ProjectRepository:
         )
         return config
 
+    async def get_config_by_id(
+        self,
+        project_id: str,
+        tenant_id:  str,
+    ) -> ProjectConfig | None:
+        """
+        Resolve a ProjectConfig directly from project_id + tenant_id.
+
+        Used by the ephemeral token path in api/chat.py where we have
+        the project_id from the token payload but no APIKeyDoc to pass
+        to get_config_for_key().
+
+        Follows the same Redis-first cache pattern as get_config_for_key().
+        """
+        # 1. Redis cache hit?
+        cached = await self._redis.get_project_config(project_id)
+        if cached is not None:
+            log.debug("Project config cache HIT (by id): %s", project_id)
+            return _dict_to_project_config(cached)
+
+        # 2. MongoDB read — scope to tenant_id for security
+        log.debug("Project config cache MISS (by id): %s", project_id)
+        doc = await self.get_by_id(project_id, tenant_id=tenant_id)
+        if doc is None or not doc.is_active:
+            return None
+
+        # 3. Populate cache
+        config = doc.to_project_config()
+        await self._redis.set_project_config(
+            project_id, _project_config_to_dict(config), ttl=_CACHE_TTL
+        )
+        return config
+
     # ── Create ────────────────────────────────────────────────
 
     async def create(

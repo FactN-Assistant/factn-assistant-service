@@ -40,7 +40,7 @@ class SessionRepository:
         self._col = mongodb.sessions
 
     # ── Write ─────────────────────────────────────────────────
-    
+
     async def close_session(
         self,
         session_id:    str,
@@ -99,10 +99,20 @@ class SessionRepository:
         project_id: str,
         limit:      int = 50,
         skip:       int = 0,
+        status:     str | None = None,
     ) -> list[SessionDoc]:
-        # to_list(None) = no limit cap; caller controls with .limit(N)
+        """
+        List session records for a project, newest first.
+ 
+        status  optional filter: "closed" | "error" | "timeout"
+                omit to return all statuses
+        """
+        query: dict = {"project_id": project_id}
+        if status is not None:
+            query["status"] = status
+ 
         cursor = (
-            self._col.find({"project_id": project_id})
+            self._col.find(query)
             .sort("started_at", -1)
             .skip(skip)
             .limit(limit)
