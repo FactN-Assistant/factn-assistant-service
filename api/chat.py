@@ -18,6 +18,20 @@ Week 6 changes from Week 5
   • Per-key rate limiting enforced at handshake time (RedisClient)
   • WebSocket is closed with a clear 4xxx code on auth / rate-limit failure
     so clients can distinguish rejection reasons without polling
+    
+New changes for plans
+──────────────────────────────
+  _resolve_project()  now enforces:
+    1. CORS — checks the request Origin header against project.allowed_origins.
+               Empty list = allow all (open project).
+               Mismatch = close with 4006.
+    2. Tenant suspension — suspended tenants cannot open new sessions.
+               Close code 4007.
+    3. Daily token quota — checks today's token usage against the plan limit.
+               Exceeded = close code 4008.
+ 
+  ws_chat()  now catches MaxSessionsExceededError from SessionManager
+             and closes with 4004.
 
 Connection URL
 ──────────────
@@ -35,8 +49,10 @@ Close codes used
   4003  Rate limit exceeded
   4004  Max concurrent sessions reached for this project
   4005  Ephemeral token already redeemed or expired
+  4006  Origin not allowed (CORS)
+  4007  Tenant account suspended
+  4008  Daily token quota exceeded
 """
-
 from __future__ import annotations
  
 import asyncio
@@ -46,8 +62,9 @@ import uuid
  
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
  
+from core import plan_limits
 from core.schemas import ProjectConfig
-from core.session_manager import SessionManager
+from core.session_manager import MaxSessionsExceededError, SessionManager
 from core.session_state import FrameKind, InputFrame, _OUTBOX_STOP
 from db.redis_client import RedisClient
 from repositories import Repositories
@@ -58,28 +75,45 @@ router = APIRouter()
  
  
 # ──────────────────────────────────────────────────────────────
-# Handshake — resolve project config from API key
+# CORS origin check
+# ──────────────────────────────────────────────────────────────
+ 
+def _origin_allowed(origin: str | None, allowed_origins: list[str]) -> bool:
+    """
+    Return True when the request origin is permitted.
+ 
+    Rules:
+      • allowed_origins is empty → allow everything (open project)
+      • origin header is missing → allow (non-browser clients, curl, etc.)
+      • origin is in the whitelist → allow
+      • otherwise → deny
+    """
+    if not allowed_origins:
+        return True
+    if origin is None:
+        return True
+    return origin in allowed_origins
+ 
+ 
+# ──────────────────────────────────────────────────────────────
+# Handshake — resolve project config from credentials
 # ──────────────────────────────────────────────────────────────
  
 async def _resolve_project(
     ws:      WebSocket,
     api_key: str | None,
     token:   str | None,
-) -> tuple[ProjectConfig, str] | None:
+) -> tuple[ProjectConfig, str, str] | None:
     """
-    Validate credentials and return (ProjectConfig, api_key_id).
- 
-    Accepts EITHER an api_key (long-lived, rate-limited) OR an ephemeral
-    token (single-use, short-lived).  Exactly one must be provided.
+    Validate credentials and return (ProjectConfig, api_key_id, tenant_plan).
+
+    Extended from the previous version with four additional checks:
+      1. CORS origin enforcement
+      2. Tenant suspension check
+      3. Daily token quota check
  
     Returns None and closes the WebSocket (with an explanatory code) if
     anything fails.  Callers must return immediately on None.
- 
-    Credential paths
-    ────────────────
-    api_key path:  verify hash → rate-limit → load project config
-    token path:    redeem atomically → extract project_id + rate_limit_rpm
-                   → load project config from Redis cache (same as api_key path)
     """
     repos: Repositories = ws.app.state.repos
     redis: RedisClient  = ws.app.state.redis
@@ -93,19 +127,19 @@ async def _resolve_project(
         return None
  
     if api_key and token:
-        # Prefer token when both are provided — token is more specific
         log.debug("Both api_key and token provided — using token")
         api_key = None
  
+    # ── Resolve config and api_key_id from whichever credential ──
+    config:     ProjectConfig | None = None
+    api_key_id: str                  = ""
+    tenant_plan: str                 = "free"
+
     # ══════════════════════════════════════════════════════════
     # PATH A: Ephemeral token
     # ══════════════════════════════════════════════════════════
     if token:
-        # Atomically read-and-delete the token from Redis.
-        # If two connections race, only one gets the payload — the other
-        # receives None and is rejected with 4005.
         payload = await redis.redeem_ephemeral_token(token)
- 
         if payload is None:
             await ws.close(
                 code=4005,
@@ -118,28 +152,18 @@ async def _resolve_project(
         api_key_id     = payload["api_key_id"]
         rate_limit_rpm = payload.get("rate_limit_rpm", 60)
  
-        # Rate-limit check using the token's project_id as the key prefix
-        # (tokens don't have a key_prefix, so we use the project_id)
         allowed, count = await redis.check_and_increment_rate_limit(
             key_prefix = f"tok:{project_id}",
             limit      = rate_limit_rpm,
             window_s   = 60,
         )
         if not allowed:
-            log.warning(
-                "Rate limit exceeded for token: project=%s count=%d limit=%d",
-                project_id, count, rate_limit_rpm,
-            )
             await ws.close(
                 code=4003,
                 reason=f"Rate limit exceeded ({rate_limit_rpm} req/min).",
             )
             return None
  
-        # Load project config from Redis cache (same path as api_key)
-        # We construct a minimal object that get_config_for_key() needs.
-        # Rather than duplicate the cache lookup logic, use a lightweight
-        # shim that matches the APIKeyDoc interface.
         config = await repos.projects.get_config_by_id(
             project_id = project_id,
             tenant_id  = tenant_id,
@@ -147,51 +171,95 @@ async def _resolve_project(
         if config is None:
             await ws.close(code=4002, reason="Project not found or inactive.")
             return None
+
+        # Fetch tenant for suspension + plan checks
+        tenant = await repos.tenants.get_by_id(tenant_id)
+        if tenant is None:
+            await ws.close(code=4001, reason="Tenant account not found.")
+            return None
+        tenant_plan = tenant.plan
  
-        log.info(
-            "Token auth: project=%s api_key_id=%s",
-            project_id, api_key_id,
-        )
-        return config, api_key_id
- 
+        log.info("Token auth: project=%s api_key_id=%s", project_id, api_key_id)
+
     # ══════════════════════════════════════════════════════════
     # PATH B: Long-lived API key
     # ══════════════════════════════════════════════════════════
+    else:
+        key_doc = await repos.api_keys.get_by_raw_key(api_key)
+        if key_doc is None:
+            await ws.close(code=4001, reason="Invalid or revoked API key.")
+            return None
  
-    # ── 2. Lookup key in DB ───────────────────────────────────
-    key_doc = await repos.api_keys.get_by_raw_key(api_key)
-    if key_doc is None:
-        log.warning("Invalid or revoked API key: prefix=%s", (api_key or "")[:12])
-        await ws.close(code=4001, reason="Invalid or revoked API key.")
-        return None
+        allowed, count = await redis.check_and_increment_rate_limit(
+            key_prefix = key_doc.key_prefix,
+            limit      = key_doc.rate_limit_rpm,
+            window_s   = 60,
+        )
+        if not allowed:
+            await ws.close(
+                code=4003,
+                reason=f"Rate limit exceeded ({key_doc.rate_limit_rpm} req/min).",
+            )
+            return None
+
+        config = await repos.projects.get_config_for_key(key_doc)
+        if config is None:
+            await ws.close(code=4002, reason="Project not found or inactive.")
+            return None
  
-    # ── 3. Rate limit check ───────────────────────────────────
-    allowed, count = await redis.check_and_increment_rate_limit(
-        key_prefix = key_doc.key_prefix,
-        limit      = key_doc.rate_limit_rpm,
-        window_s   = 60,
-    )
-    if not allowed:
+        api_key_id = key_doc.id
+ 
+        # Fetch tenant for suspension + plan checks
+        tenant = await repos.tenants.get_by_id(key_doc.tenant_id)
+        if tenant is None:
+            await ws.close(code=4001, reason="Tenant account not found.")
+            return None
+        tenant_plan = tenant.plan
+
+    # ── 2. CORS origin enforcement ────────────────────────────
+    origin = ws.headers.get("origin")
+    if not _origin_allowed(origin, config.allowed_origins):
         log.warning(
-            "Rate limit exceeded: key=%s count=%d limit=%d",
-            key_doc.key_prefix, count, key_doc.rate_limit_rpm,
+            "CORS rejected: origin=%s project=%s allowed=%s",
+            origin, config.project_id, config.allowed_origins,
         )
         await ws.close(
-            code=4003,
-            reason=f"Rate limit exceeded ({key_doc.rate_limit_rpm} req/min).",
+            code=4006,
+            reason=f"Origin '{origin}' is not allowed for this project.",
         )
         return None
- 
-    # ── 4. Load project config (Redis-cached) ─────────────────
-    config = await repos.projects.get_config_for_key(key_doc)
-    if config is None:
+
+    # ── 3. Tenant suspension check ────────────────────────────
+    if tenant.is_suspended:
         log.warning(
-            "Project not found or inactive: project_id=%s", key_doc.project_id
+            "Suspended tenant attempted WebSocket: tenant=%s project=%s",
+            tenant.id, config.project_id,
         )
-        await ws.close(code=4002, reason="Project not found or inactive.")
+        await ws.close(
+            code=4007,
+            reason="Account suspended. Please check your billing or contact support.",
+        )
         return None
- 
-    return config, key_doc.id
+
+    # ── 4. Daily token quota check ────────────────────────────
+    quota = plan_limits.daily_token_quota(tenant_plan)
+    if quota is not None:
+        today_tokens = await repos.sessions.get_daily_token_usage(tenant.id)
+        if today_tokens >= quota:
+            log.warning(
+                "Daily token quota exceeded: tenant=%s plan=%s quota=%d used=%d",
+                tenant.id, tenant_plan, quota, today_tokens,
+            )
+            await ws.close(
+                code=4008,
+                reason=(
+                    f"Daily token quota of {quota:,} tokens exceeded. "
+                    "Quota resets at midnight UTC."
+                ),
+            )
+            return None
+
+    return config, api_key_id, tenant_plan
  
  
 # ──────────────────────────────────────────────────────────────
@@ -199,10 +267,6 @@ async def _resolve_project(
 # ──────────────────────────────────────────────────────────────
  
 async def _forward_loop(ws: WebSocket, state) -> None:
-    """
-    Drain the session outbox and write frames to the client WebSocket.
-    Exits on _OUTBOX_STOP sentinel or WebSocket disconnect.
-    """
     while True:
         item = await state.outbox.get()
  
@@ -271,12 +335,6 @@ async def _forward_loop(ws: WebSocket, state) -> None:
 # ──────────────────────────────────────────────────────────────
  
 async def _receive_loop(ws: WebSocket, state) -> None:
-    """
-    Read frames from the client WebSocket and push InputFrames onto inbox.
- 
-    Binary frames  → AUDIO_CHUNK (only while voice_active)
-    Text frames    → parsed JSON control messages
-    """
     sid          = state.session_id
     voice_active = False
  
@@ -288,7 +346,6 @@ async def _receive_loop(ws: WebSocket, state) -> None:
                 log.info("[%s] client disconnected", sid)
                 return
  
-            # ── Binary: raw PCM ────────────────────────────────
             if "bytes" in message and message["bytes"]:
                 if not voice_active:
                     log.debug("[%s] audio bytes outside voice turn — ignoring", sid)
@@ -301,7 +358,6 @@ async def _receive_loop(ws: WebSocket, state) -> None:
                     log.warning("[%s] inbox full — dropping audio chunk", sid)
                 continue
  
-            # ── Text: JSON control messages ────────────────────
             raw_text = message.get("text", "")
             if not raw_text:
                 continue
@@ -403,24 +459,38 @@ async def ws_chat(
     session_id  Optional UUID to resume an existing Gemini session.
  
     Exactly one of api_key or token must be provided.
+ 
+    New close codes vs previous version:
+      4006  Origin not allowed (CORS enforcement)
+      4007  Tenant account suspended
+      4008  Daily token quota exceeded
     """
     await ws.accept()
  
-    # ── Resolve project from credentials ──────────────────────
     resolved = await _resolve_project(ws, api_key, token)
     if resolved is None:
-        return  # WebSocket already closed with a 4xxx code
+        return
  
-    project, api_key_id = resolved
+    project, api_key_id, tenant_plan = resolved
     sid     = session_id or str(uuid.uuid4())
     manager: SessionManager = ws.app.state.session_manager
  
     log.info(
-        "[%s] WebSocket connected (project=%s tenant=%s)",
-        sid, project.project_id, project.tenant_id,
+        "[%s] WebSocket connected (project=%s tenant=%s plan=%s)",
+        sid, project.project_id, project.tenant_id, tenant_plan,
     )
  
-    state = await manager.get_or_create(sid, project, api_key_id=api_key_id)
+    try:
+        state = await manager.get_or_create(sid, project, api_key_id=api_key_id)
+    except MaxSessionsExceededError:
+        await ws.close(
+            code=4004,
+            reason=(
+                f"This project has reached its maximum concurrent session limit "
+                f"of {project.max_concurrent_sessions}."
+            ),
+        )
+        return
  
     try:
         await asyncio.gather(

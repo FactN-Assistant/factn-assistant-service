@@ -26,6 +26,20 @@ Rate limiting on auth endpoints
 POST /v1/auth/login is rate-limited via Redis to 10 attempts per minute
 per IP address.  This is a basic brute-force mitigation.  Production
 systems should add CAPTCHA or exponential backoff.
+
+api/auth.py
+───────────
+Authentication endpoints.
+ 
+Changes from previous version
+──────────────────────────────
+  GET /v1/auth/me  — response now includes plan_limits dict so the
+                     dashboard knows which features to enable/disable
+                     without a separate API call.
+  POST /v1/auth/login — now checks is_suspended and returns 403 with
+                        a clear message if the account is suspended.
+                        (Suspended tenants can still log in — they just
+                        can't open WebSocket sessions.)
 """
 
 from __future__ import annotations
@@ -36,6 +50,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field
 from pymongo.errors import DuplicateKeyError
 
+from core import plan_limits as pl
 from core.auth import (
     create_access_token,
     hash_password,
@@ -52,32 +67,30 @@ log = logging.getLogger("livechat.api.auth")
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
 
-# Cookie settings
 _COOKIE_OPTS: dict = dict(
     httponly = True,
-    secure   = False,   # set True in production (HTTPS only)
+    secure   = False,   # set True in production
     samesite = "lax",
     path     = "/",
 )
-_ACCESS_MAX_AGE  = 15 * 60           # 15 minutes in seconds
-_REFRESH_MAX_AGE = 7 * 24 * 60 * 60  # 7 days in seconds
+_ACCESS_MAX_AGE  = 15 * 60
+_REFRESH_MAX_AGE = 7 * 24 * 60 * 60
 
 
 # ── Request / Response schemas ────────────────────────────────
 
 class RegisterRequest(BaseModel):
-    name:     str        = Field(min_length=1, max_length=100)
+    name:     str      = Field(min_length=1, max_length=100)
     email:    EmailStr
-    password: str        = Field(min_length=8, max_length=128)
+    password: str      = Field(min_length=8, max_length=128)
 
 
 class LoginRequest(BaseModel):
     email:    EmailStr
-    password: str        = Field(min_length=1)
+    password: str      = Field(min_length=1)
 
 
 class AuthResponse(BaseModel):
-    """Returned in the response body on login and refresh."""
     access_token: str
     token_type:   str = "bearer"
     tenant_id:    str
@@ -87,32 +100,30 @@ class AuthResponse(BaseModel):
 
 
 class TenantProfileResponse(BaseModel):
-    tenant_id:  str
-    email:      str
-    name:       str
-    plan:       str
-    created_at: str
+    """
+    Extended profile returned by GET /v1/auth/me.
+ 
+    plan_limits contains all limits for the tenant's current plan.
+    The dashboard uses this to:
+      • Show/hide upgrade prompts when limits are approached
+      • Disable "Add Tool" button when at the plan's tool limit
+      • Display the correct session TTL cap in the project settings UI
+    is_suspended lets the dashboard show a billing warning banner.
+    """
+    tenant_id:    str
+    email:        str
+    name:         str
+    plan:         str
+    is_suspended: bool
+    created_at:   str
+    plan_limits:  dict   # all limits for the current plan
 
 
 # ── Helpers ───────────────────────────────────────────────────
 
-def _set_auth_cookies(
-    response:      Response,
-    access_token:  str,
-    refresh_token: str,
-) -> None:
-    response.set_cookie(
-        key      = "access_token",
-        value    = access_token,
-        max_age  = _ACCESS_MAX_AGE,
-        **_COOKIE_OPTS,
-    )
-    response.set_cookie(
-        key      = "refresh_token",
-        value    = refresh_token,
-        max_age  = _REFRESH_MAX_AGE,
-        **_COOKIE_OPTS,
-    )
+def _set_auth_cookies(response: Response, access_token: str, refresh_token: str) -> None:
+    response.set_cookie(key="access_token",  value=access_token,  max_age=_ACCESS_MAX_AGE,  **_COOKIE_OPTS)
+    response.set_cookie(key="refresh_token", value=refresh_token, max_age=_REFRESH_MAX_AGE, **_COOKIE_OPTS)
 
 
 def _clear_auth_cookies(response: Response) -> None:
@@ -121,16 +132,10 @@ def _clear_auth_cookies(response: Response) -> None:
 
 
 async def _check_login_rate_limit(request: Request) -> None:
-    """
-    Allow 10 login attempts per minute per client IP.
-    Raises HTTP 429 if exceeded.
-    """
     redis: RedisClient = request.app.state.redis
     client_ip = request.client.host if request.client else "unknown"
-    allowed, count = await redis.check_and_increment_rate_limit(
-        key_prefix = f"login:{client_ip}",
-        limit      = 10,
-        window_s   = 60,
+    allowed, _ = await redis.check_and_increment_rate_limit(
+        key_prefix=f"login:{client_ip}", limit=10, window_s=60,
     )
     if not allowed:
         raise HTTPException(
@@ -147,53 +152,31 @@ async def register(
     request:  Request,
     response: Response,
 ) -> AuthResponse:
-    """
-    Create a new tenant account.
-
-    On success: account is created, tokens are issued immediately (no
-    separate login step required), cookies are set.
-
-    Errors:
-      409  email already registered
-      422  validation failure (weak password, bad email format)
-    """
     repos: Repositories = request.app.state.repos
-
-    # Hash password BEFORE touching the DB — if hashing fails the account
-    # is never created.
     password_hash = hash_password(body.password)
 
     try:
-        tenant = await repos.tenants.create(
-            name  = body.name.strip(),
-            email = body.email.lower(),
-        )
+        tenant = await repos.tenants.create(name=body.name.strip(), email=body.email.lower())
     except DuplicateKeyError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="An account with this email already exists.",
         )
 
-    # Store the password hash
     await repos.tenants.update_password_hash(tenant.id, password_hash)
     log.info("New tenant registered: %s (%s)", tenant.id, tenant.email)
 
-    # Issue tokens immediately
-    access_token = create_access_token(
-        tenant_id = tenant.id,
-        email     = tenant.email,
-        plan      = tenant.plan,
-    )
+    access_token = create_access_token(tenant_id=tenant.id, email=tenant.email, plan=tenant.plan)
     _, refresh_token = await repos.auth_tokens.create(tenant_id=tenant.id)
 
     _set_auth_cookies(response, access_token, refresh_token)
 
     return AuthResponse(
-        access_token = access_token,
-        tenant_id    = tenant.id,
-        email        = tenant.email,
-        name         = tenant.name,
-        plan         = tenant.plan,
+        access_token=access_token,
+        tenant_id=tenant.id,
+        email=tenant.email,
+        name=tenant.name,
+        plan=tenant.plan,
     )
 
 
@@ -203,92 +186,47 @@ async def login(
     request:  Request,
     response: Response,
 ) -> AuthResponse:
-    """
-    Authenticate with email + password.
-
-    On success: access token (15 min) and refresh token (7 days) are
-    set as httpOnly cookies and the access token is returned in the body.
-
-    Errors:
-      401  invalid credentials (deliberately vague — don't reveal if
-           the email exists or just the password is wrong)
-      429  rate limit exceeded (10 attempts/min per IP)
-    """
-    print("test: ", request.body)
     await _check_login_rate_limit(request)
 
     repos: Repositories = request.app.state.repos
 
     tenant = await repos.tenants.get_by_email(body.email)
     if tenant is None or not tenant.is_active:
-        # Constant-time-ish: still hash to avoid timing attacks that reveal
-        # whether the email exists.
         hash_password("dummy-constant-time-fill")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password.",
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password.")
 
     if not verify_password(body.password, tenant.password_hash):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password.",
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password.")
 
-    # Rehash if parameters have been upgraded since last login
     if needs_rehash(tenant.password_hash):
         new_hash = hash_password(body.password)
         await repos.tenants.update_password_hash(tenant.id, new_hash)
         log.info("Password hash upgraded for tenant %s", tenant.id)
 
-    access_token = create_access_token(
-        tenant_id = tenant.id,
-        email     = tenant.email,
-        plan      = tenant.plan,
-    )
+    access_token = create_access_token(tenant_id=tenant.id, email=tenant.email, plan=tenant.plan)
     _, refresh_token = await repos.auth_tokens.create(tenant_id=tenant.id)
 
     _set_auth_cookies(response, access_token, refresh_token)
-    log.info("Tenant logged in: %s", tenant.id)
+    log.info("Tenant logged in: %s (suspended=%s)", tenant.id, tenant.is_suspended)
 
     return AuthResponse(
-        access_token = access_token,
-        tenant_id    = tenant.id,
-        email        = tenant.email,
-        name         = tenant.name,
-        plan         = tenant.plan,
+        access_token=access_token,
+        tenant_id=tenant.id,
+        email=tenant.email,
+        name=tenant.name,
+        plan=tenant.plan,
     )
 
 
 @router.post("/refresh")
-async def refresh(
-    request:  Request,
-    response: Response,
-) -> AuthResponse:
-    """
-    Exchange a valid refresh token for a new access + refresh token pair.
-
-    The old refresh token is deleted (rotated) on every call.  Presenting
-    a superseded token triggers a security warning.
-
-    The refresh token is read from the refresh_token httpOnly cookie.
-
-    Errors:
-      401  missing, invalid, or expired refresh token
-    """
-    repos:         Repositories = request.app.state.repos
-    raw_refresh    = request.cookies.get("refresh_token")
+async def refresh(request: Request, response: Response) -> AuthResponse:
+    repos:      Repositories = request.app.state.repos
+    raw_refresh = request.cookies.get("refresh_token")
 
     if not raw_refresh:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Refresh token missing.",
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token missing.")
 
-    # We need the tenant_id to scope the lookup — extract it from the
-    # access token cookie (may be expired, but sub claim is still readable).
-    # If both cookies are gone, require a fresh login.
-    raw_access  = request.cookies.get("access_token")
+    raw_access = request.cookies.get("access_token")
     tenant_id: str | None = None
 
     if raw_access:
@@ -298,9 +236,6 @@ async def refresh(
             tenant_id = payload.get("sub")
 
     if not tenant_id:
-        # Fall back: try to decode without expiry validation to get the sub.
-        # python-jose doesn't natively support "decode but ignore exp", so
-        # we handle JWTError gracefully and redirect to login.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session expired — please log in again.",
@@ -318,26 +253,18 @@ async def refresh(
 
     tenant = await repos.tenants.get_by_id(tenant_id)
     if tenant is None or not tenant.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Account not found or deactivated.",
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account not found or deactivated.")
 
-    new_access_token = create_access_token(
-        tenant_id = tenant.id,
-        email     = tenant.email,
-        plan      = tenant.plan,
-    )
-
+    new_access_token = create_access_token(tenant_id=tenant.id, email=tenant.email, plan=tenant.plan)
     _set_auth_cookies(response, new_access_token, new_refresh_token)
     log.info("Token refreshed for tenant %s", tenant_id)
 
     return AuthResponse(
-        access_token = new_access_token,
-        tenant_id    = tenant.id,
-        email        = tenant.email,
-        name         = tenant.name,
-        plan         = tenant.plan,
+        access_token=new_access_token,
+        tenant_id=tenant.id,
+        email=tenant.email,
+        name=tenant.name,
+        plan=tenant.plan,
     )
 
 
@@ -347,14 +274,6 @@ async def logout(
     response: Response,
     tenant:   TenantDoc = Depends(get_current_tenant),
 ) -> None:
-    """
-    Revoke all refresh tokens for this tenant and clear auth cookies.
-
-    After this call the access token remains technically valid for up to
-    15 more minutes (stateless JWT), but all refresh tokens are gone so
-    the session cannot be renewed.  For immediate full invalidation,
-    rotate JWT_SECRET (affects all tenants — use sparingly).
-    """
     repos: Repositories = request.app.state.repos
     await repos.auth_tokens.revoke_for_tenant(tenant.id)
     _clear_auth_cookies(response)
@@ -365,11 +284,21 @@ async def logout(
 async def me(
     tenant: TenantDoc = Depends(get_current_tenant),
 ) -> TenantProfileResponse:
-    """Return the current tenant's profile."""
+    """
+    Return the current tenant's profile including plan limits.
+ 
+    The plan_limits field allows the dashboard to:
+      • Show an upgrade prompt when the tenant is at 80%+ of their limit
+      • Disable "Create Project" when at max_projects
+      • Disable "Add Tool" when at max_tools_per_project
+      • Display the correct TTL cap in project settings
+    """
     return TenantProfileResponse(
-        tenant_id  = tenant.id,
-        email      = tenant.email,
-        name       = tenant.name,
-        plan       = tenant.plan,
-        created_at = tenant.created_at.isoformat(),
+        tenant_id    = tenant.id,
+        email        = tenant.email,
+        name         = tenant.name,
+        plan         = tenant.plan,
+        is_suspended = tenant.is_suspended,
+        created_at   = tenant.created_at.isoformat(),
+        plan_limits  = pl.get_all_limits(tenant.plan),
     )

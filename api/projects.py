@@ -1,7 +1,7 @@
 """
 api/projects.py
 ───────────────
-Project CRUD + Tool CRUD + synchronous test endpoint.
+Project CRUD + Tool CRUD + synchronous test endpoint + sub-resource PUT endpoints.
 
 Route map
 ─────────
@@ -42,6 +42,27 @@ connecting a WebSocket client.
 
 The test session is completely isolated from production sessions — it uses
 a fresh Gemini connection that is closed immediately after the turn.
+
+Changes from previous version
+──────────────────────────────
+  POST /v1/projects
+    — Enforces plan.max_projects limit.
+    — Caps session_ttl_seconds to plan.max_session_ttl_seconds.
+    — Caps rate_limit_rpm to plan.max_rate_limit_rpm.
+ 
+  POST /v1/projects/{id}/tools
+    — Enforces plan.max_tools_per_project limit.
+    — Caps tool timeout_ms to plan.max_webhook_timeout_ms.
+ 
+  POST /v1/projects/{id}/keys (unchanged — in api/keys.py)
+    — rate_limit_rpm now capped there too (see api/keys.py).
+ 
+  NEW: PUT /v1/projects/{id}/system-prompt
+  NEW: PUT /v1/projects/{id}/voice-config
+  NEW: PUT /v1/projects/{id}/webhook-config
+    — Dedicated endpoints for the three sidebar sections that users
+      iterate on most.  Each is atomic, independently retryable, and
+      produces a clean audit trail.
 """
 
 from __future__ import annotations
@@ -56,6 +77,7 @@ from google.genai import types
 from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime, timezone, timedelta
 
+from core import plan_limits
 from core.documents import ProjectDoc, TenantDoc
 from core.gemini_runner import build_gemini_config
 from core.schemas import (
@@ -71,10 +93,8 @@ log = logging.getLogger("livechat.api.projects")
 
 router = APIRouter(prefix="/v1/projects", tags=["projects"])
 
-# Gemini-supported JSON Schema primitive types
 _VALID_PARAM_TYPES = {"string", "number", "integer", "boolean", "array", "object"}
 
-# Supported Gemini models (extend as new models are released)
 _SUPPORTED_MODELS = {
     "gemini-2.5-flash-native-audio-preview-12-2025",
     "gemini-2.0-flash-live-001",
@@ -84,49 +104,27 @@ _SUPPORTED_MODELS = {
 # ── Tool parameter validation ─────────────────────────────────
 
 def validate_tool_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
-    """
-    Validate a tool parameters object against the JSON Schema subset
-    that Gemini's function_declarations API accepts.
-
-    Raises ValueError with a descriptive message on any violation.
-    Returns the parameters dict unchanged on success.
-    """
     if not isinstance(parameters, dict):
         raise ValueError("parameters must be a JSON object.")
-
     if parameters.get("type") != "object":
-        raise ValueError(
-            'parameters.type must be "object". '
-            "Gemini function declarations always wrap parameters in an object."
-        )
-
+        raise ValueError('parameters.type must be "object".')
     properties = parameters.get("properties", {})
     if not isinstance(properties, dict):
         raise ValueError("parameters.properties must be a JSON object.")
-
     for prop_name, prop_schema in properties.items():
         if not isinstance(prop_schema, dict):
-            raise ValueError(
-                f'Property "{prop_name}" must be a JSON object with at least a "type" field.'
-            )
+            raise ValueError(f'Property "{prop_name}" must be a JSON object.')
         prop_type = prop_schema.get("type")
         if not prop_type:
-            raise ValueError(
-                f'Property "{prop_name}" is missing a "type" field.'
-            )
+            raise ValueError(f'Property "{prop_name}" is missing a "type" field.')
         if prop_type not in _VALID_PARAM_TYPES:
             raise ValueError(
                 f'Property "{prop_name}" has unsupported type "{prop_type}". '
                 f"Supported: {sorted(_VALID_PARAM_TYPES)}."
             )
-        # Validate enum values are the same type as the property
         if "enum" in prop_schema:
             if not isinstance(prop_schema["enum"], list) or not prop_schema["enum"]:
-                raise ValueError(
-                    f'Property "{prop_name}".enum must be a non-empty list.'
-                )
-
-    # Validate required list
+                raise ValueError(f'Property "{prop_name}".enum must be a non-empty list.')
     required = parameters.get("required", [])
     if not isinstance(required, list):
         raise ValueError("parameters.required must be a list of strings.")
@@ -134,10 +132,7 @@ def validate_tool_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(r, str):
             raise ValueError("Every entry in parameters.required must be a string.")
         if r not in properties:
-            raise ValueError(
-                f'Required field "{r}" is not defined in parameters.properties.'
-            )
-
+            raise ValueError(f'Required field "{r}" not in parameters.properties.')
     return parameters
 
 
@@ -178,14 +173,11 @@ class CreateProjectRequest(BaseModel):
     @classmethod
     def validate_model(cls, v: str) -> str:
         if v not in _SUPPORTED_MODELS:
-            raise ValueError(
-                f'Unsupported model "{v}". Supported: {sorted(_SUPPORTED_MODELS)}.'
-            )
+            raise ValueError(f'Unsupported model "{v}". Supported: {sorted(_SUPPORTED_MODELS)}.')
         return v
 
 
 class UpdateProjectRequest(BaseModel):
-    """All fields optional — only provided fields are updated (PATCH semantics)."""
     name:                    str | None   = Field(default=None, min_length=1, max_length=100)
     description:             str | None   = Field(default=None, max_length=500)
     system_prompt:           str | None   = Field(default=None, min_length=1, max_length=32_000)
@@ -203,14 +195,40 @@ class UpdateProjectRequest(BaseModel):
     @classmethod
     def validate_model(cls, v: str | None) -> str | None:
         if v is not None and v not in _SUPPORTED_MODELS:
-            raise ValueError(
-                f'Unsupported model "{v}". Supported: {sorted(_SUPPORTED_MODELS)}.'
-            )
+            raise ValueError(f'Unsupported model "{v}".')
         return v
 
 
+# ── Sub-resource request schemas (new PUT endpoints) ──────────
+
+class SystemPromptRequest(BaseModel):
+    """Body for PUT /v1/projects/{id}/system-prompt."""
+    system_prompt: str = Field(min_length=1, max_length=32_000)
+
+
+class VoiceConfigUpdateRequest(BaseModel):
+    """Body for PUT /v1/projects/{id}/voice-config."""
+    voice_name:    str  = Field(default="Kore",  min_length=1, max_length=64)
+    language_code: str  = Field(default="en-US", min_length=2, max_length=16)
+    enabled:       bool = True
+    vad_mode:      str  = "manual"
+
+    @field_validator("vad_mode")
+    @classmethod
+    def validate_vad(cls, v: str) -> str:
+        if v not in ("manual", "auto"):
+            raise ValueError('vad_mode must be "manual" or "auto".')
+        return v
+ 
+ 
+class WebhookConfigRequest(BaseModel):
+    """Body for PUT /v1/projects/{id}/webhook-config."""
+    webhook_url:     str | None  = None
+    webhook_secret:  str | None  = None
+    allowed_origins: list[str]   = Field(default_factory=list)
+
+
 class ProjectResponse(BaseModel):
-    """Safe project representation — never exposes webhook_secret."""
     project_id:              str
     tenant_id:               str
     name:                    str
@@ -241,7 +259,6 @@ class ProjectResponse(BaseModel):
             voice_config            = doc.voice_config.model_dump(),
             vad_config              = doc.vad_config.model_dump(),
             tools                   = [
-                # Strip webhook_secret from tool responses
                 {k: v for k, v in t.model_dump().items() if k != "webhook_secret"}
                 for t in doc.tools
             ],
@@ -259,11 +276,7 @@ class ProjectResponse(BaseModel):
 # ── Tool request / response schemas ──────────────────────────
 
 class CreateToolRequest(BaseModel):
-    name:            str  = Field(
-        min_length=1,
-        max_length=64,
-        pattern=r"^[a-z][a-z0-9_]*$",   # snake_case, Gemini requirement
-    )
+    name:            str  = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
     description:     str  = Field(min_length=1, max_length=1000)
     parameters:      dict[str, Any]
     execution_mode:  str  = "static"
@@ -287,18 +300,13 @@ class CreateToolRequest(BaseModel):
     @model_validator(mode="after")
     def validate_execution_fields(self) -> "CreateToolRequest":
         if self.execution_mode == "static" and self.static_response is None:
-            raise ValueError(
-                'static_response is required when execution_mode is "static".'
-            )
+            raise ValueError('static_response is required when execution_mode is "static".')
         if self.execution_mode == "webhook" and not self.webhook_url:
-            raise ValueError(
-                'webhook_url is required when execution_mode is "webhook".'
-            )
+            raise ValueError('webhook_url is required when execution_mode is "webhook".')
         return self
 
 
 class UpdateToolRequest(BaseModel):
-    """All fields optional — only provided fields are updated."""
     description:     str | None             = Field(default=None, min_length=1, max_length=1000)
     parameters:      dict[str, Any] | None  = None
     execution_mode:  str | None             = None
@@ -330,12 +338,11 @@ class ToolResponse(BaseModel):
     static_response: dict[str, Any] | None
     webhook_url:     str | None
     timeout_ms:      int
-    # webhook_secret intentionally excluded
 
 
 class TestRequest(BaseModel):
-    text:           str  = Field(min_length=1, max_length=4000)
-    timeout_seconds: int  = Field(default=30, ge=5, le=120)
+    text:            str = Field(min_length=1, max_length=4000)
+    timeout_seconds: int = Field(default=30, ge=5, le=120)
 
 
 class TestResponse(BaseModel):
@@ -348,9 +355,7 @@ class TestResponse(BaseModel):
 
 # ── Helper ────────────────────────────────────────────────────
 
-def _get_project_or_404(
-    doc: ProjectDoc | None, project_id: str
-) -> ProjectDoc:
+def _get_project_or_404(doc: ProjectDoc | None, project_id: str) -> ProjectDoc:
     if doc is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -369,8 +374,32 @@ async def create_project(
     request: Request,
     tenant:  TenantDoc = Depends(get_current_tenant),
 ) -> ProjectResponse:
-    """Create a new chatbot project."""
+    """
+    Create a new chatbot project.
+ 
+    Plan enforcement
+    ────────────────
+    • Checks the tenant's current project count against plan.max_projects.
+    • Caps session_ttl_seconds to plan.max_session_ttl_seconds.
+    • Caps rate_limit_rpm to plan.max_rate_limit_rpm.
+    """
     repos: Repositories = request.app.state.repos
+ 
+    # ── Plan: project count limit ──────────────────────────────
+    existing_projects = await repos.projects.list_for_tenant(tenant.id, limit=1000)
+    if not plan_limits.is_within_project_limit(tenant.plan, len(existing_projects)):
+        limit = plan_limits.max_projects(tenant.plan)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Your {tenant.plan} plan allows a maximum of {limit} project(s). "
+                "Upgrade your plan to create more projects."
+            ),
+        )
+
+    # ── Plan: cap session TTL and rate limit ───────────────────
+    effective_ttl = plan_limits.effective_session_ttl(tenant.plan, body.session_ttl_seconds)
+    effective_rpm = plan_limits.effective_rate_limit_rpm(tenant.plan, body.rate_limit_rpm)
 
     doc = await repos.projects.create(
         tenant_id               = tenant.id,
@@ -380,14 +409,17 @@ async def create_project(
         gemini_model            = body.gemini_model,
         voice_config            = VoiceConfig(**body.voice_config.model_dump()),
         vad_config              = VADConfig(mode=body.vad_config.mode),
-        session_ttl_seconds     = body.session_ttl_seconds,
+        session_ttl_seconds     = effective_ttl,
         max_concurrent_sessions = body.max_concurrent_sessions,
-        rate_limit_rpm          = body.rate_limit_rpm,
+        rate_limit_rpm          = effective_rpm,
         webhook_url             = body.webhook_url,
         webhook_secret          = body.webhook_secret,
         allowed_origins         = body.allowed_origins,
     )
-    log.info("Project created: %s (tenant=%s)", doc.id, tenant.id)
+    log.info(
+        "Project created: %s (tenant=%s plan=%s ttl=%d rpm=%d)",
+        doc.id, tenant.id, tenant.plan, effective_ttl, effective_rpm,
+    )
     return ProjectResponse.from_doc(doc)
 
 
@@ -398,7 +430,6 @@ async def list_projects(
     skip:    int = 0,
     tenant:  TenantDoc = Depends(get_current_tenant),
 ) -> list[ProjectResponse]:
-    """List all projects for the authenticated tenant, newest first."""
     repos: Repositories = request.app.state.repos
     docs = await repos.projects.list_for_tenant(
         tenant_id = tenant.id,
@@ -414,7 +445,6 @@ async def get_project(
     request:    Request,
     tenant:     TenantDoc = Depends(get_current_tenant),
 ) -> ProjectResponse:
-    """Get a single project by ID."""
     repos: Repositories = request.app.state.repos
     doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
     return ProjectResponse.from_doc(_get_project_or_404(doc, project_id))
@@ -428,34 +458,37 @@ async def update_project(
     tenant:     TenantDoc = Depends(get_current_tenant),
 ) -> ProjectResponse:
     """
-    Partially update a project (PATCH semantics — only provided fields change).
+    Partially update a project — name, description, model, session limits.
 
-    The Redis project config cache is invalidated automatically, so the next
-    WebSocket connection will pick up the new system prompt / tools / voice
-    within milliseconds.
+    Plan enforcement: session_ttl_seconds and rate_limit_rpm are capped
+    to the tenant's plan limits if provided.
     """
     repos: Repositories = request.app.state.repos
 
-    # Verify project exists and belongs to this tenant
     doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
     _get_project_or_404(doc, project_id)
 
-    # Build the update dict from only the fields explicitly provided
     updates: dict[str, Any] = {}
     if body.name                    is not None: updates["name"]                    = body.name
     if body.description             is not None: updates["description"]             = body.description
     if body.system_prompt           is not None: updates["system_prompt"]           = body.system_prompt
     if body.gemini_model            is not None: updates["gemini_model"]            = body.gemini_model
-    if body.session_ttl_seconds     is not None: updates["session_ttl_seconds"]     = body.session_ttl_seconds
     if body.max_concurrent_sessions is not None: updates["max_concurrent_sessions"] = body.max_concurrent_sessions
-    if body.rate_limit_rpm          is not None: updates["rate_limit_rpm"]          = body.rate_limit_rpm
     if body.webhook_url             is not None: updates["webhook_url"]             = body.webhook_url
     if body.webhook_secret          is not None: updates["webhook_secret"]          = body.webhook_secret
     if body.allowed_origins         is not None: updates["allowed_origins"]         = body.allowed_origins
-    if body.voice_config            is not None:
-        updates["voice_config"] = body.voice_config.model_dump()
-    if body.vad_config              is not None:
-        updates["vad_config"] = body.vad_config.model_dump()
+    if body.voice_config            is not None: updates["voice_config"]            = body.voice_config.model_dump()
+    if body.vad_config              is not None: updates["vad_config"]              = body.vad_config.model_dump()
+
+    # Cap plan-sensitive fields
+    if body.session_ttl_seconds is not None:
+        updates["session_ttl_seconds"] = plan_limits.effective_session_ttl(
+            tenant.plan, body.session_ttl_seconds
+        )
+    if body.rate_limit_rpm is not None:
+        updates["rate_limit_rpm"] = plan_limits.effective_rate_limit_rpm(
+            tenant.plan, body.rate_limit_rpm
+        )
 
     if not updates:
         raise HTTPException(
@@ -464,8 +497,6 @@ async def update_project(
         )
 
     await repos.projects.update(project_id, tenant.id, updates)
-
-    # Re-fetch the updated document to return fresh data
     updated = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
     return ProjectResponse.from_doc(updated)  # type: ignore[arg-type]
 
@@ -476,21 +507,117 @@ async def delete_project(
     request:    Request,
     tenant:     TenantDoc = Depends(get_current_tenant),
 ) -> None:
-    """
-    Soft-delete a project.
+    repos: Repositories = request.app.state.repos
+    doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
+    _get_project_or_404(doc, project_id)
+    await repos.projects.soft_delete(project_id, tenant.id)
+    log.info("Project soft-deleted: %s (tenant=%s)", project_id, tenant.id)
 
-    Sets is_active=False and invalidates the Redis cache.  Existing active
-    Gemini sessions continue until their TTL expires.  New WebSocket
-    connections for this project will receive a 4002 close code.
-    API keys associated with this project are NOT automatically revoked —
-    they simply resolve to an inactive project and are rejected at handshake.
+
+# ══════════════════════════════════════════════════════════════
+# SUB-RESOURCE PUT ENDPOINTS  (new in this release)
+# Each maps to one sidebar section in the dashboard.
+# All three follow the same pattern:
+#   1. Verify project ownership
+#   2. Validate the sub-resource payload
+#   3. Write only the relevant fields via repos.projects.update()
+#   4. Return the full updated ProjectResponse
+# ══════════════════════════════════════════════════════════════
+
+@router.put("/{project_id}/system-prompt")
+async def update_system_prompt(
+    project_id: str,
+    body:       SystemPromptRequest,
+    request:    Request,
+    tenant:     TenantDoc = Depends(get_current_tenant),
+) -> ProjectResponse:
+    """
+    Replace the project system prompt.
+
+    Maps to the System Prompt sidebar tab save button.
+    Invalidates the Redis project config cache — next session picks up
+    the new prompt immediately.
     """
     repos: Repositories = request.app.state.repos
     doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
     _get_project_or_404(doc, project_id)
 
-    await repos.projects.soft_delete(project_id, tenant.id)
-    log.info("Project soft-deleted: %s (tenant=%s)", project_id, tenant.id)
+    await repos.projects.update(
+        project_id, tenant.id,
+        {"system_prompt": body.system_prompt},
+    )
+    log.info("System prompt updated: project=%s tenant=%s", project_id, tenant.id)
+ 
+    updated = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
+    return ProjectResponse.from_doc(updated)  # type: ignore[arg-type]
+
+
+@router.put("/{project_id}/voice-config")
+async def update_voice_config(
+    project_id: str,
+    body:       VoiceConfigUpdateRequest,
+    request:    Request,
+    tenant:     TenantDoc = Depends(get_current_tenant),
+) -> ProjectResponse:
+    """
+    Replace the project voice and VAD configuration.
+ 
+    Maps to the Voice Config sidebar tab save button.
+    Stores voice_config and vad_config as a single atomic update.
+    Next Gemini session opened for this project uses the new voice.
+    """
+    repos: Repositories = request.app.state.repos
+    doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
+    _get_project_or_404(doc, project_id)
+ 
+    await repos.projects.update(
+        project_id, tenant.id,
+        {
+            "voice_config": {
+                "voice_name":    body.voice_name,
+                "language_code": body.language_code,
+                "enabled":       body.enabled,
+            },
+            "vad_config": {"mode": body.vad_mode},
+        },
+    )
+    log.info("Voice config updated: project=%s tenant=%s", project_id, tenant.id)
+ 
+    updated = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
+    return ProjectResponse.from_doc(updated)  # type: ignore[arg-type]
+
+
+@router.put("/{project_id}/webhook-config")
+async def update_webhook_config(
+    project_id: str,
+    body:       WebhookConfigRequest,
+    request:    Request,
+    tenant:     TenantDoc = Depends(get_current_tenant),
+) -> ProjectResponse:
+    """
+    Replace the project webhook and CORS configuration.
+
+    Maps to the Webhook / Security sidebar tab save button.
+    Updates webhook_url, webhook_secret, and allowed_origins atomically.
+    CORS enforcement on new WebSocket connections takes effect immediately
+    (Redis cache is invalidated, allowed_origins is on ProjectConfig).
+    """
+    repos: Repositories = request.app.state.repos
+    doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
+    _get_project_or_404(doc, project_id)
+ 
+    await repos.projects.update(
+        project_id, tenant.id,
+        {
+            "webhook_url":     body.webhook_url,
+            "webhook_secret":  body.webhook_secret,
+            "allowed_origins": body.allowed_origins,
+        },
+    )
+    log.info("Webhook config updated: project=%s tenant=%s", project_id, tenant.id)
+
+    updated = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
+    return ProjectResponse.from_doc(updated)  # type: ignore[arg-type]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -507,29 +634,35 @@ async def add_tool(
     """
     Add a new tool definition to a project.
 
-    Tool names must be unique within a project (snake_case, max 64 chars).
-    Adding a tool invalidates the Redis cache — the next Gemini session
-    opened for this project will include the new tool automatically.
+    Plan enforcement
+    ────────────────
+    • Checks tool count against plan.max_tools_per_project.
+    • Caps tool timeout_ms to plan.max_webhook_timeout_ms.
     """
     repos: Repositories = request.app.state.repos
 
     doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
     _get_project_or_404(doc, project_id)
 
-    # Enforce unique tool names within the project
     if any(t.name == body.name for t in doc.tools):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"A tool named '{body.name}' already exists in this project.",
         )
 
-    # Enforce per-plan tool limit (free tier: 3, starter: 10, etc.)
-    # For now enforce a hard max of 30 — plan-based limits added in Week 9
-    if len(doc.tools) >= 30:
+    # ── Plan: tool count limit ─────────────────────────────────
+    if not plan_limits.is_within_tool_limit(tenant.plan, len(doc.tools)):
+        limit = plan_limits.max_tools_per_project(tenant.plan)
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Maximum of 30 tools per project reached.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Your {tenant.plan} plan allows a maximum of {limit} tool(s) per project. "
+                "Upgrade your plan to add more tools."
+            ),
         )
+
+    # ── Plan: cap webhook timeout ──────────────────────────────
+    effective_timeout = plan_limits.effective_webhook_timeout_ms(tenant.plan, body.timeout_ms)
 
     new_tool = ToolDefinition(
         name            = body.name,
@@ -539,12 +672,15 @@ async def add_tool(
         static_response = body.static_response,
         webhook_url     = body.webhook_url,
         webhook_secret  = body.webhook_secret,
-        timeout_ms      = body.timeout_ms,
+        timeout_ms      = effective_timeout,
     )
 
     updated_tools = list(doc.tools) + [new_tool]
     await repos.projects.set_tools(project_id, tenant.id, updated_tools)
-    log.info("Tool added: %s → project %s", body.name, project_id)
+    log.info(
+        "Tool added: %s → project %s (plan=%s timeout_ms=%d)",
+        body.name, project_id, tenant.plan, effective_timeout,
+    )
 
     return _tool_to_response(new_tool)
 
@@ -555,7 +691,6 @@ async def list_tools(
     request:    Request,
     tenant:     TenantDoc = Depends(get_current_tenant),
 ) -> list[ToolResponse]:
-    """List all tool definitions for a project."""
     repos: Repositories = request.app.state.repos
     doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
     _get_project_or_404(doc, project_id)
@@ -570,19 +705,11 @@ async def update_tool(
     request:    Request,
     tenant:     TenantDoc = Depends(get_current_tenant),
 ) -> ToolResponse:
-    """
-    Update a single tool definition by name (PATCH semantics).
-
-    Only the fields provided in the request body are changed.
-    Replaces the entire tools array atomically in MongoDB and invalidates
-    the Redis cache so new sessions immediately use the updated definition.
-    """
     repos: Repositories = request.app.state.repos
 
     doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
     _get_project_or_404(doc, project_id)
 
-    # Find the tool to update
     tool_index = next(
         (i for i, t in enumerate(doc.tools) if t.name == tool_name), None
     )
@@ -592,7 +719,6 @@ async def update_tool(
             detail=f"Tool '{tool_name}' not found in project '{project_id}'.",
         )
 
-    # Apply partial updates to a copy of the existing tool
     existing = doc.tools[tool_index]
     updated_fields = existing.model_dump()
 
@@ -602,11 +728,14 @@ async def update_tool(
     if body.static_response is not None: updated_fields["static_response"] = body.static_response
     if body.webhook_url     is not None: updated_fields["webhook_url"]     = body.webhook_url
     if body.webhook_secret  is not None: updated_fields["webhook_secret"]  = body.webhook_secret
-    if body.timeout_ms      is not None: updated_fields["timeout_ms"]      = body.timeout_ms
+    if body.timeout_ms      is not None:
+        # Cap updated timeout to plan limit
+        updated_fields["timeout_ms"] = plan_limits.effective_webhook_timeout_ms(
+            tenant.plan, body.timeout_ms
+        )
 
     updated_tool = ToolDefinition.model_validate(updated_fields)
 
-    # Validate execution mode consistency after merging
     if updated_tool.execution_mode == "static" and updated_tool.static_response is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -636,13 +765,6 @@ async def delete_tool(
     request:    Request,
     tenant:     TenantDoc = Depends(get_current_tenant),
 ) -> None:
-    """
-    Remove a tool definition from a project.
-
-    Invalidates the Redis cache.  Existing active Gemini sessions are NOT
-    affected — they were opened with the old config.  Only new sessions
-    after this call will lack the removed tool.
-    """
     repos: Repositories = request.app.state.repos
 
     doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
@@ -670,31 +792,9 @@ async def test_project(
     request:    Request,
     tenant:     TenantDoc = Depends(get_current_tenant),
 ) -> TestResponse:
-    """
-    Send a single text message to a temporary Gemini session and return
-    the full response synchronously.
-
-    Design
-    ──────
-    This opens a FRESH Gemini Live session for each test call, completely
-    separate from the production SessionManager.  It:
-      1. Loads the current project config from MongoDB (bypasses Redis cache
-         so you always test the latest saved config)
-      2. Opens a Gemini session with that config
-      3. Sends the test message
-      4. Drains the response stream until turn_complete
-      5. Closes the Gemini session
-
-    The session is never added to the SessionManager registry, so it does
-    not count against the project's max_concurrent_sessions limit.
-
-    Timeout is enforced at the API layer — if Gemini doesn't respond within
-    timeout_seconds, a 504 is returned and the connection is cleaned up.
-    """
     repos:         Repositories = request.app.state.repos
     gemini_client: genai.Client = request.app.state.session_manager._client
 
-    # Always read from MongoDB for test — bypasses the 60s Redis cache
     doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
     _get_project_or_404(doc, project_id)
 
@@ -728,18 +828,11 @@ async def test_project(
 
 
 async def _run_test_turn(
-    client:       genai.Client,
-    model:        str,
-    config:       types.LiveConnectConfig,
-    text:         str,
+    client:  genai.Client,
+    model:   str,
+    config:  types.LiveConnectConfig,
+    text:    str,
 ) -> TestResponse:
-    """
-    Open a temporary Gemini Live session, send one text turn, collect the
-    full response, and close the session.
-
-    Tool calls are executed using static responses only (no webhook calls
-    during test) to keep the test endpoint predictable and fast.
-    """
     import time
     start_ms = int(time.monotonic() * 1000)
 
@@ -749,21 +842,12 @@ async def _run_test_turn(
     output_tokens = 0
 
     async with client.aio.live.connect(model=model, config=config) as gsession:
-        # Send the test message
         await gsession.send_client_content(
-            turns=[
-                types.Content(
-                    role="user",
-                    parts=[types.Part(text=text)],
-                )
-            ],
+            turns=[types.Content(role="user", parts=[types.Part(text=text)])],
             turn_complete=True,
         )
 
-        # Drain the response stream
         async for response in gsession.receive():
-
-            # Capture token usage
             if response.usage_metadata:
                 usage = response.usage_metadata
                 input_tokens  = getattr(usage, "prompt_token_count",     0) or 0
@@ -773,30 +857,21 @@ async def _run_test_turn(
 
             sc = response.server_content
             if sc is not None:
-                # Collect output transcription (text response)
                 if sc.output_transcription and sc.output_transcription.text:
                     assistant_parts.append(sc.output_transcription.text)
-
-                # Also collect text parts from model_turn (non-audio response)
                 if sc.model_turn and sc.model_turn.parts:
                     for part in sc.model_turn.parts:
                         if part.text:
                             assistant_parts.append(part.text)
-
                 if sc.turn_complete or sc.interrupted:
                     break
 
-            # Handle tool calls — static responses only for test endpoint
             if response.tool_call:
                 function_responses = []
                 for fc in response.tool_call.function_calls:
                     args   = dict(fc.args) if fc.args else {}
                     result = {"note": "Test mode — static response only."}
-                    tool_calls_log.append({
-                        "tool":   fc.name,
-                        "args":   args,
-                        "result": result,
-                    })
+                    tool_calls_log.append({"tool": fc.name, "args": args, "result": result})
                     function_responses.append(
                         types.FunctionResponse(
                             id=getattr(fc, "id", ""),
@@ -804,9 +879,7 @@ async def _run_test_turn(
                             response={"result": result},
                         )
                     )
-                await gsession.send_tool_response(
-                    function_responses=function_responses
-                )
+                await gsession.send_tool_response(function_responses=function_responses)
 
     latency_ms = int(time.monotonic() * 1000) - start_ms
     return TestResponse(
@@ -818,29 +891,11 @@ async def _run_test_turn(
     )
 
 
-# ── Internal helper ───────────────────────────────────────────
-
-def _tool_to_response(tool: ToolDefinition) -> ToolResponse:
-    return ToolResponse(
-        name            = tool.name,
-        description     = tool.description,
-        parameters      = tool.parameters,
-        execution_mode  = tool.execution_mode,
-        static_response = tool.static_response,
-        webhook_url     = tool.webhook_url,
-        timeout_ms      = tool.timeout_ms,
-    )
-
-
 # ══════════════════════════════════════════════════════════════
-# SESSION ANALYTICS  (Week 10, Task 3)
+# SESSION ANALYTICS
 # ══════════════════════════════════════════════════════════════
 
 class SessionSummaryResponse(BaseModel):
-    """
-    Single session record returned by GET /v1/projects/{id}/sessions.
-    Mirrors the SessionDoc fields that are safe to expose via the API.
-    """
     session_id:       str
     project_id:       str
     status:           str
@@ -863,13 +918,9 @@ class SessionListResponse(BaseModel):
 
 
 class UsageSummaryResponse(BaseModel):
-    """
-    Aggregated usage metrics for a project over a time window.
-    Returned by GET /v1/projects/{id}/usage.
-    """
     project_id:           str
-    since:                str   # ISO8601 — start of the reporting window
-    until:                str   # ISO8601 — end of the reporting window (now)
+    since:                str
+    until:                str
     total_sessions:       int
     total_turns:          int
     total_tool_calls:     int
@@ -880,8 +931,8 @@ class UsageSummaryResponse(BaseModel):
     total_tokens:         int
     error_count:          int
     error_rate_pct:       float
-
-
+ 
+ 
 @router.get("/{project_id}/sessions")
 async def list_sessions(
     project_id: str,
@@ -891,37 +942,15 @@ async def list_sessions(
     status:     str | None = None,
     tenant:     TenantDoc = Depends(get_current_tenant),
 ) -> SessionListResponse:
-    """
-    List session records for a project, newest first.
-
-    Query parameters
-    ────────────────
-    limit   max sessions to return (1–200, default 50)
-    skip    offset for pagination
-    status  filter by status: "closed" | "error" | "timeout"
-            omit to return all statuses
-
-    Each session record includes start/end times, duration, turn count,
-    tool call count, and token usage — suitable for a session history table
-    in the dashboard.
-    """
     repos: Repositories = request.app.state.repos
-
-    # Verify project belongs to this tenant
     doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
     _get_project_or_404(doc, project_id)
-
     limit = max(1, min(limit, 200))
-
     sessions = await repos.sessions.list_for_project(
-        project_id = project_id,
-        limit      = limit,
-        skip       = skip,
-        status     = status,
+        project_id=project_id, limit=limit, skip=skip, status=status,
     )
-
     return SessionListResponse(
-        sessions = [
+        sessions=[
             SessionSummaryResponse(
                 session_id       = s.id,
                 project_id       = s.project_id,
@@ -938,32 +967,26 @@ async def list_sessions(
             )
             for s in sessions
         ],
-        total = len(sessions),
-        limit = limit,
-        skip  = skip,
+        total=len(sessions), limit=limit, skip=skip,
     )
 
 
 @router.get("/{project_id}/sessions/{session_id_path}")
 async def get_session(
-    project_id:       str,
-    session_id_path:  str,
-    request:          Request,
-    tenant:           TenantDoc = Depends(get_current_tenant),
+    project_id:      str,
+    session_id_path: str,
+    request:         Request,
+    tenant:          TenantDoc = Depends(get_current_tenant),
 ) -> SessionSummaryResponse:
-    """Get a single session record by its ID."""
     repos: Repositories = request.app.state.repos
-
     doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
     _get_project_or_404(doc, project_id)
-
     session = await repos.sessions.get_by_id(session_id_path, project_id)
     if session is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session '{session_id_path}' not found.",
         )
-
     return SessionSummaryResponse(
         session_id       = session.id,
         project_id       = session.project_id,
@@ -987,37 +1010,18 @@ async def get_usage(
     days:       int = 30,
     tenant:     TenantDoc = Depends(get_current_tenant),
 ) -> UsageSummaryResponse:
-    """
-    Aggregate usage metrics for a project over the last N days.
-
-    Query parameters
-    ────────────────
-    days   reporting window in days (1–365, default 30)
-
-    Returns totals and averages for: sessions, turns, tool calls, duration,
-    and token consumption (input + output). Suitable for the analytics tab
-    in the dashboard.
-    """
     repos: Repositories = request.app.state.repos
-
     doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
     _get_project_or_404(doc, project_id)
-
     days  = max(1, min(days, 365))
     since = datetime.now(timezone.utc) - timedelta(days=days)
     until = datetime.now(timezone.utc)
-
-    summary = await repos.sessions.usage_summary(
-        project_id = project_id,
-        since      = since,
-    )
-
+    summary = await repos.sessions.usage_summary(project_id=project_id, since=since)
     total_sessions = summary.get("total_sessions", 0)
     total_dur      = summary.get("total_duration_s", 0.0)
     error_count    = summary.get("error_count", 0)
     total_in       = summary.get("total_input_tokens", 0)
     total_out      = summary.get("total_output_tokens", 0)
-
     return UsageSummaryResponse(
         project_id          = project_id,
         since               = since.isoformat(),
@@ -1033,3 +1037,18 @@ async def get_usage(
         error_count         = error_count,
         error_rate_pct      = round(error_count / total_sessions * 100, 1) if total_sessions else 0.0,
     )
+
+
+# ── Internal helper ───────────────────────────────────────────
+
+def _tool_to_response(tool: ToolDefinition) -> ToolResponse:
+    return ToolResponse(
+        name            = tool.name,
+        description     = tool.description,
+        parameters      = tool.parameters,
+        execution_mode  = tool.execution_mode,
+        static_response = tool.static_response,
+        webhook_url     = tool.webhook_url,
+        timeout_ms      = tool.timeout_ms,
+    )
+ 

@@ -32,6 +32,12 @@ references trivial and avoids ObjectId serialisation headaches in Pydantic.
 
 This was migrated to PyMongo Async removing Motor due to the reason Motor is about to deprecate.
 PyMongo Async note: create_index is awaitable, same as Motor.
+
+Changes for Plans
+──────────────────────────────
+  tenants  — added partial index on is_suspended for fast suspension queries.
+  sessions — added compound (tenant_id, started_at) for daily token quota
+             aggregation in get_daily_token_usage().
 """
 
 from __future__ import annotations
@@ -54,6 +60,13 @@ async def ensure_indexes(mongodb: MongoDB) -> None:
         [("email", ASCENDING)],
         unique=True,
         name="tenants_email_unique",
+    )
+    # Partial index: only indexes documents where is_suspended=True.
+    # Used by admin queries to list all currently suspended tenants.
+    await mongodb.tenants.create_index(
+        [("is_suspended", ASCENDING)],
+        partialFilterExpression={"is_suspended": True},
+        name="tenants_suspended",
     )
 
     # ── projects ──────────────────────────────────────────────
@@ -99,9 +112,15 @@ async def ensure_indexes(mongodb: MongoDB) -> None:
         [("status", ASCENDING)],
         name="sessions_by_status",
     )
+    # Compound index for daily token quota aggregation.
+    # get_daily_token_usage() filters on tenant_id + started_at (today).
+    # This index serves that query without a full collection scan.
+    await mongodb.sessions.create_index(
+        [("tenant_id", ASCENDING), ("started_at", DESCENDING)],
+        name="sessions_tenant_date",
+    )
 
-    # ── auth_tokens (Week 6 — refresh token store) ────────────
-    # TTL index: documents auto-delete when expires_at is reached.
+    # ── auth_tokens ───────────────────────────────────────────
     await mongodb.db["auth_tokens"].create_index(
         [("expires_at", ASCENDING)],
         expireAfterSeconds=0,
