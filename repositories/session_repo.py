@@ -22,12 +22,17 @@ Use to_list(None) to retrieve all results (no hard limit).
 Use to_list(N) to cap at N documents.
 Never use to_list(0) — this is invalid in PyMongo Async (was valid in Motor).
 
+Changes from previous version
+──────────────────────────────
+  get_daily_token_usage()  new method — returns total tokens consumed by a
+                           tenant today.  Called at session open to enforce
+                           daily_token_quota plan limits.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from core.documents import SessionDoc
 from db.mongo import MongoDB
@@ -58,9 +63,7 @@ class SessionRepository:
         """
         Persist a session record on close.  Always called from the
         session_runner's finally block — runs even on error/cancel.
- 
-        Non-critical: write failures are logged but never re-raised so
-        the session shutdown path is never blocked.
+        Non-critical: write failures are logged but never re-raised.
         """
         ended_at = datetime.now(timezone.utc)
         duration = (ended_at - started_at).total_seconds()
@@ -101,12 +104,6 @@ class SessionRepository:
         skip:       int = 0,
         status:     str | None = None,
     ) -> list[SessionDoc]:
-        """
-        List session records for a project, newest first.
- 
-        status  optional filter: "closed" | "error" | "timeout"
-                omit to return all statuses
-        """
         query: dict = {"project_id": project_id}
         if status is not None:
             query["status"] = status
@@ -150,7 +147,6 @@ class SessionRepository:
                 }},
             }},
         ]
-        # PyMongo Async: to_list(None) replaces to_list(length=1) from Motor
         results = await self._col.aggregate(pipeline).to_list(None)
         if not results:
             return {
@@ -165,3 +161,35 @@ class SessionRepository:
         r = results[0]
         r.pop("_id", None)
         return r
+
+    async def get_daily_token_usage(self, tenant_id: str) -> int:
+        """
+        Return the total tokens (input + output) consumed by a tenant
+        since the start of the current UTC day.
+ 
+        Called at WebSocket handshake time to enforce daily_token_quota.
+        The aggregation is a simple $sum on a date-filtered match —
+        no index beyond sessions_by_tenant is needed.
+ 
+        Returns 0 when there are no sessions today (new account, or
+        quota reset just fired).
+        """
+        start_of_day = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        pipeline = [
+            {"$match": {
+                "tenant_id":  tenant_id,
+                "started_at": {"$gte": start_of_day},
+            }},
+            {"$group": {
+                "_id":          None,
+                "total_tokens": {
+                    "$sum": {"$add": ["$input_tokens", "$output_tokens"]}
+                },
+            }},
+        ]
+        results = await self._col.aggregate(pipeline).to_list(None)
+        if not results:
+            return 0
+        return results[0].get("total_tokens", 0)

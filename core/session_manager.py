@@ -26,6 +26,15 @@ so every session close writes a SessionDoc to MongoDB automatically.
  
 The session_repo is stored on the manager at construction time and passed
 to every new runner task — callers don't need to pass it per-session.
+
+New Changes for plans
+──────────────────────────────
+  get_or_create()  now enforces max_concurrent_sessions per project using
+                   the plan limit via plan_limits.is_within_concurrent_sessions().
+                   Raises MaxSessionsExceededError when the cap is hit so
+                   the WebSocket handler can close with code 4004.
+ 
+  MaxSessionsExceededError  new exception — caught in api/chat.py.
 """
 
 from __future__ import annotations
@@ -42,7 +51,15 @@ from .session_state import FrameKind, InputFrame, SessionState
 
 log = logging.getLogger("livechat.session_manager")
 
-_CLEANUP_INTERVAL = 60
+_CLEANUP_INTERVAL = 60   # seconds between idle-session sweeps
+
+
+class MaxSessionsExceededError(Exception):
+    """
+    Raised by get_or_create() when a project has reached its
+    max_concurrent_sessions cap.  The WebSocket handler catches this
+    and closes the connection with code 4004.
+    """
 
 
 class SessionManager:
@@ -91,16 +108,41 @@ class SessionManager:
     ) -> SessionState:
         """
         Return an existing session (resume) or open a fresh Gemini session.
-        api_key_id  stored on SessionState so the session record references
-                    which key opened this session (written on close).
+
+        Raises MaxSessionsExceededError when the project has already reached
+        its max_concurrent_sessions cap.  The caller (api/chat.py) is
+        responsible for closing the WebSocket with code 4004.
+
+        The cap comes from project.max_concurrent_sessions which is set at
+        project creation time and capped by plan_limits.effective_session_ttl()
+        during the PATCH /v1/projects endpoint.  Plan enforcement happens at
+        the REST layer — the session manager trusts the value on the config.
         """
         async with self._lock:
+            # ── Resume existing session ────────────────────────
             state = self._sessions.get(session_id)
             if state is not None:
                 state.touch()
                 log.info("[%s] resuming existing session", session_id)
                 return state
 
+            # ── Enforce concurrent session cap ─────────────────
+            project_session_count = sum(
+                1 for s in self._sessions.values()
+                if s.project_id == project.project_id
+            )
+            if project_session_count >= project.max_concurrent_sessions:
+                log.warning(
+                    "[%s] concurrent session cap reached: project=%s cap=%d current=%d",
+                    session_id, project.project_id,
+                    project.max_concurrent_sessions, project_session_count,
+                )
+                raise MaxSessionsExceededError(
+                    f"Project {project.project_id} has reached its "
+                    f"max_concurrent_sessions limit of {project.max_concurrent_sessions}."
+                )
+
+            # ── Create new session ─────────────────────────────
             state = SessionState(
                 session_id = session_id,
                 project_id = project.project_id,
@@ -114,7 +156,7 @@ class SessionManager:
                 state        = state,
                 client       = self._client,
                 project      = project,
-                session_repo = self._session_repo,   # ← wired in here
+                session_repo = self._session_repo,
             ),
             name=f"runner-{session_id}",
         )
@@ -124,7 +166,9 @@ class SessionManager:
         )
 
         log.info(
-            "[%s] new session created (project=%s)", session_id, project.project_id
+            "[%s] new session created (project=%s count_before=%d cap=%d)",
+            session_id, project.project_id,
+            project_session_count, project.max_concurrent_sessions,
         )
         return state
 
@@ -138,6 +182,14 @@ class SessionManager:
         async with self._lock:
             return list(self._sessions.keys())
 
+    async def active_sessions_for_project(self, project_id: str) -> int:
+        """Return the current session count for a specific project."""
+        async with self._lock:
+            return sum(
+                1 for s in self._sessions.values()
+                if s.project_id == project_id
+            )
+ 
     # ── Internal ──────────────────────────────────────────────
 
     async def _on_runner_done(self, session_id: str) -> None:

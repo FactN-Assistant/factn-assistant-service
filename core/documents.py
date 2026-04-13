@@ -42,6 +42,14 @@ Week 6 additions
 ────────────────
   SessionDoc  — added input_tokens, output_tokens fields
   AuthTokenDoc — new: refresh token store for JWT auth (Week 6)
+  
+new Changes for plans
+──────────────────────────────
+  TenantDoc   — added is_suspended (bool) for quota/billing suspension
+  ProjectDoc  — no changes
+  APIKeyDoc   — no changes
+  SessionDoc  — no changes
+  AuthTokenDoc — no changes
 """
 
 from __future__ import annotations
@@ -77,6 +85,7 @@ class TenantDoc(BaseModel):
     created_at:     datetime = Field(default_factory=_now)
     updated_at:     datetime = Field(default_factory=_now)
     is_active:      bool     = True
+    is_suspended:   bool     = False   # True when quota exceeded or billing lapsed
 
     def to_mongo(self) -> dict[str, Any]:
         return self.model_dump(by_alias=True)
@@ -132,6 +141,7 @@ class ProjectDoc(BaseModel):
             session_ttl_seconds     = self.session_ttl_seconds,
             max_concurrent_sessions = self.max_concurrent_sessions,
             rate_limit_rpm          = self.rate_limit_rpm,
+            allowed_origins         = self.allowed_origins,
         )
 
 
@@ -171,24 +181,12 @@ class APIKeyDoc(BaseModel):
             return False
         return True
 
+
 # ──────────────────────────────────────────────────────────────
 # Session (append-only analytics record)
 # ──────────────────────────────────────────────────────────────
 
 class SessionDoc(BaseModel):
-    """
-    Written once when a Gemini session closes.  Never updated.
- 
-    Token fields
-    ────────────
-    input_tokens   accumulated from usage_metadata.prompt_token_count
-    output_tokens  accumulated from usage_metadata.candidates_token_count
- 
-    The Gemini Live API reports these cumulatively via usage_metadata
-    on server messages.  We capture the LAST values before session close.
-    For audio-only sessions total_token_count may be the only value
-    available; in that case it is stored in output_tokens.
-    """
     model_config = ConfigDict(populate_by_name=True)
 
     id:               str      = Field(alias="_id")
@@ -211,30 +209,21 @@ class SessionDoc(BaseModel):
     @classmethod
     def from_mongo(cls, doc: dict[str, Any]) -> "SessionDoc":
         return cls.model_validate(doc)
-    
+
+
 # ──────────────────────────────────────────────────────────────
-# Auth Token  (Week 6 — refresh token store)
+# Auth Token  (refresh token store)
 # ──────────────────────────────────────────────────────────────
  
 class AuthTokenDoc(BaseModel):
-    """
-    Persisted refresh token.
- 
-    Stored in the auth_tokens collection with a TTL index on expires_at
-    so MongoDB auto-deletes expired tokens.  The token_hash is an
-    argon2 hash of the raw refresh token — same security model as API keys.
- 
-    On logout or token rotation, the document is deleted explicitly
-    (doesn't wait for the TTL to expire).
-    """
     model_config = ConfigDict(populate_by_name=True)
  
     id:           str      = Field(default_factory=_new_id, alias="_id")
     tenant_id:    str
-    token_hash:   str                # argon2 hash of raw refresh token
-    token_family: str      = ""      # rotation family — detect reuse attacks
+    token_hash:   str
+    token_family: str      = ""
     created_at:   datetime = Field(default_factory=_now)
-    expires_at:   datetime           # TTL index on this field
+    expires_at:   datetime
  
     def to_mongo(self) -> dict[str, Any]:
         return self.model_dump(by_alias=True)

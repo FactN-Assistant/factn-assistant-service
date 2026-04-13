@@ -6,6 +6,11 @@ TenantRepository — CRUD for the `tenants` collection.
 All methods are async and return domain objects (TenantDoc), never raw
 Motor dicts.  Callers never touch Motor directly.
 
+New Changes for plans
+──────────────────────────────
+  suspend()     set is_suspended = True (quota exceeded / billing lapsed)
+  unsuspend()   set is_suspended = False (payment received / quota reset)
+
 Error handling
 ──────────────
   DuplicateKeyError  → raised as-is; the API layer translates to HTTP 409.
@@ -33,13 +38,6 @@ class TenantRepository:
     # ── Create ────────────────────────────────────────────────
 
     async def create(self, name: str, email: str) -> TenantDoc:
-        """
-        Insert a new tenant.
-
-        Raises DuplicateKeyError if the email is already registered.
-        The password_hash field is empty — Week 6 auth layer fills it in
-        after calling argon2 hashing.
-        """
         doc = TenantDoc(
             id    = str(uuid.uuid4()),
             name  = name,
@@ -77,6 +75,22 @@ class TenantRepository:
         )
         return result.modified_count == 1
 
+    async def update_plan(self, tenant_id: str, plan: str) -> bool:
+        """
+        Update a tenant's plan tier.
+        Called from the Stripe webhook handler when a subscription changes.
+        """
+        result = await self._col.update_one(
+            {"_id": tenant_id},
+            {"$set": {
+                "plan":       plan,
+                "updated_at": datetime.now(timezone.utc),
+            }},
+        )
+        if result.modified_count:
+            log.info("Tenant plan updated: %s → %s", tenant_id, plan)
+        return result.modified_count == 1
+
     async def set_active(self, tenant_id: str, active: bool) -> bool:
         result = await self._col.update_one(
             {"_id": tenant_id},
@@ -85,6 +99,42 @@ class TenantRepository:
                 "updated_at": datetime.now(timezone.utc),
             }},
         )
+        return result.modified_count == 1
+
+    async def suspend(self, tenant_id: str) -> bool:
+        """
+        Suspend a tenant account.
+        Called when daily token quota is exceeded or billing lapses.
+        Suspended tenants:
+          • Cannot open new WebSocket sessions (rejected at handshake)
+          • Can still access the dashboard REST API
+          • Can still manage projects and keys (but can't use them for chat)
+        """
+        result = await self._col.update_one(
+            {"_id": tenant_id},
+            {"$set": {
+                "is_suspended": True,
+                "updated_at":   datetime.now(timezone.utc),
+            }},
+        )
+        if result.modified_count:
+            log.warning("Tenant suspended: %s", tenant_id)
+        return result.modified_count == 1
+
+    async def unsuspend(self, tenant_id: str) -> bool:
+        """
+        Lift a suspension.
+        Called when a Stripe payment succeeds or quota resets at midnight.
+        """
+        result = await self._col.update_one(
+            {"_id": tenant_id},
+            {"$set": {
+                "is_suspended": False,
+                "updated_at":   datetime.now(timezone.utc),
+            }},
+        )
+        if result.modified_count:
+            log.info("Tenant unsuspended: %s", tenant_id)
         return result.modified_count == 1
 
     # ── Delete ────────────────────────────────────────────────

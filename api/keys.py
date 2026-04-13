@@ -9,6 +9,13 @@ Subsequent GET requests return only the key_prefix and metadata.
 POST /v1/projects/{project_id}/keys         create a new key
 GET  /v1/projects/{project_id}/keys         list keys for a project
 DELETE /v1/projects/{project_id}/keys/{id}  revoke a key
+
+Changes for plans
+──────────────────────────────
+  POST /v1/projects/{id}/keys
+    — rate_limit_rpm is now capped to plan_limits.max_rate_limit_rpm.
+      A free-tier tenant cannot create a key with 1000 rpm — it is silently
+      capped to their plan's maximum.
 """
 
 from __future__ import annotations
@@ -18,6 +25,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
+from core import plan_limits
 from core.documents import TenantDoc
 from repositories import Repositories
 
@@ -32,14 +40,13 @@ router = APIRouter(prefix="/v1/projects", tags=["api-keys"])
 
 class CreateKeyRequest(BaseModel):
     label:          str = "Default key"
-    key_type:       str = "publishable"   # "publishable" | "secret"
+    key_type:       str = "publishable"
     rate_limit_rpm: int = 60
 
 
 class KeyCreatedResponse(BaseModel):
-    """Returned ONCE on key creation — includes the raw key."""
     key_id:         str
-    raw_key:        str   # SHOW ONCE — never stored, cannot be recovered
+    raw_key:        str
     key_prefix:     str
     key_type:       str
     label:          str
@@ -48,7 +55,6 @@ class KeyCreatedResponse(BaseModel):
 
 
 class KeySummaryResponse(BaseModel):
-    """Safe to return on list — never includes the raw key or hash."""
     key_id:         str
     key_prefix:     str
     key_type:       str
@@ -71,32 +77,32 @@ async def create_key(
     """
     Generate a new API key for a project.
 
-    Returns the raw key ONCE — store it securely.  It cannot be recovered.
+    Plan enforcement: rate_limit_rpm is capped to the plan's maximum.
+    Returns the raw key ONCE — store it securely.
     """
     repos: Repositories = request.app.state.repos
 
-    # Verify project belongs to this tenant
     project = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found.")
 
     if body.key_type not in ("publishable", "secret"):
-        raise HTTPException(
-            status_code=422,
-            detail="key_type must be 'publishable' or 'secret'.",
-        )
+        raise HTTPException(status_code=422, detail="key_type must be 'publishable' or 'secret'.")
+
+    # Cap rate_limit_rpm to plan limit
+    effective_rpm = plan_limits.effective_rate_limit_rpm(tenant.plan, body.rate_limit_rpm)
 
     key_doc, raw_key = await repos.api_keys.create(
         project_id     = project_id,
         tenant_id      = tenant.id,
         label          = body.label,
         key_type       = body.key_type,
-        rate_limit_rpm = body.rate_limit_rpm,
+        rate_limit_rpm = effective_rpm,
     )
 
     log.info(
-        "API key created: %s (project=%s type=%s)",
-        key_doc.key_prefix, project_id, body.key_type,
+        "API key created: %s (project=%s type=%s rpm=%d plan=%s)",
+        key_doc.key_prefix, project_id, body.key_type, effective_rpm, tenant.plan,
     )
 
     return KeyCreatedResponse(
@@ -116,7 +122,6 @@ async def list_keys(
     request:    Request,
     tenant:     TenantDoc = Depends(get_current_tenant),
 ) -> list[KeySummaryResponse]:
-    """List all API keys for a project (prefix only — no raw keys or hashes)."""
     repos: Repositories = request.app.state.repos
 
     project = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
@@ -149,13 +154,6 @@ async def revoke_key(
     request:    Request,
     tenant:     TenantDoc = Depends(get_current_tenant),
 ) -> None:
-    """
-    Revoke an API key permanently.
-
-    Revocation takes effect immediately for all new WebSocket connections.
-    Existing active sessions are NOT forcibly closed — they continue until
-    the session TTL expires or the client disconnects.
-    """
     repos: Repositories = request.app.state.repos
 
     project = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)

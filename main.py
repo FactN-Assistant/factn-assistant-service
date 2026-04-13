@@ -32,9 +32,19 @@ Week 8 changes from Week 7
   • Tokens router registered (POST /v1/tokens, POST /v1/tokens/rotate)
   • Version bumped to 0.8.0
 
+Changes from previous version
+──────────────────────────────
+  • Version bumped to 0.9.0
+  • /health endpoint now exposes plan_limits summary for ops monitoring
+  • All routers remain the same — no new routers needed for this release
+    (plan enforcement, CORS, suspension, and lifecycle webhooks are
+    implemented inside existing routers and the session manager)
+ 
 Running locally
 ───────────────
-  cp .env.example .env    # fill in MONGO_URI, REDIS_URL, GEMINI_API_KEY
+  cp .env.example .env    # fill in MONGO_URI, REDIS_URL, GEMINI_API_KEY, JWT_SECRET
+  pip install -r requirements.txt
+  python scripts/seed.py
   uvicorn main:app --reload --port 8000
 """
 
@@ -55,6 +65,7 @@ from api.tokens import router as tokens_router
 from api.projects import router as projects_router
 from api.chat import router as chat_router
 from api.keys import router as keys_router
+from core.plan_limits import PLAN_LIMITS
 from core.session_manager import SessionManager
 from db.indexes import ensure_indexes
 from db.mongo import MongoDB
@@ -80,20 +91,18 @@ async def lifespan(app: FastAPI):
     2.  MongoDB indexes ensured
     3.  Redis
     4.  Repositories bundle
-    5.  SessionManager  ← now receives session_repo for session logging
+    5.  SessionManager
     6.  Attach all to app.state
  
     Shutdown order (reverse)
     ─────────────────────────
-    1.  SessionManager.stop()  — gracefully closes all Gemini sessions
+    1.  SessionManager.stop()
     2.  Redis.close()
     3.  MongoDB.close()
     """
-
-    # ── Validate required env vars ────────────────────────────
-    mongo_uri = os.environ.get("MONGO_URI", "")
-    mongo_db  = os.environ.get("MONGO_DB_NAME", "livechat_dev")
-    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
+    mongo_uri  = os.environ.get("MONGO_URI", "")
+    mongo_db   = os.environ.get("MONGO_DB_NAME", "livechat_dev")
+    redis_url  = os.environ.get("REDIS_URL", "redis://localhost:6379")
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     jwt_secret = os.environ.get("JWT_SECRET", "")
 
@@ -120,7 +129,6 @@ async def lifespan(app: FastAPI):
     # ── Gemini + SessionManager ───────────────────────────────
     gemini_client = genai.Client(api_key=gemini_key)
 
-    # Pass session_repo so every session close writes to MongoDB
     manager = SessionManager(
         gemini_client = gemini_client,
         session_repo  = repos.sessions,
@@ -133,7 +141,11 @@ async def lifespan(app: FastAPI):
     app.state.repos           = repos
     app.state.session_manager = manager
 
-    log.info("Application startup complete (db=%s)", mongo_db)
+    log.info(
+        "Application startup complete (db=%s) — plan tiers: %s",
+        mongo_db,
+        ", ".join(PLAN_LIMITS.keys()),
+    )
     yield
 
     # ── Shutdown ──────────────────────────────────────────────
@@ -145,9 +157,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title       = "FactN Assistant",
-    version     = "5.8.0",
-    description = "Multi-tenant AI chatbot-as-a-service With Google Gemini Live",
+    title       = "LiveChat API Platform",
+    version     = "0.9.0",
+    description = (
+        "Multi-tenant AI Chatbot-as-a-Service powered by Google Gemini Live API. "
+        "v0.9.0 adds plan enforcement, CORS, tenant suspension, "
+        "daily token quotas, session lifecycle webhooks, and "
+        "dedicated sub-resource endpoints for system prompt, voice config, "
+        "and webhook config."
+    ),
     lifespan    = lifespan,
 )
 
@@ -169,7 +187,12 @@ app.include_router(keys_router)
 
 @app.get("/")
 async def root() -> dict:
-    return {"service": app.title, "version": app.version, "status": "ok"}
+    return {
+        "service": app.title,
+        "version": app.version,
+        "status":  "ok",
+        "plans":   list(PLAN_LIMITS.keys()),
+    }
 
 
 @app.get("/health")
@@ -187,4 +210,5 @@ async def health(request: Request) -> dict:
         "redis":           "ok" if redis_ok else "unreachable",
         "active_sessions": await manager.active_session_count(),
         "session_ids":     await manager.get_active_session_ids(),
+        "version":         app.version,
     }

@@ -53,6 +53,17 @@ Week 6 additions
  
     The session_repo is None-safe — if it hasn't been wired in (e.g. in
     tests) the write is skipped silently.
+    
+New Changes for plans
+──────────────────────────────
+  session_runner()  now accepts project_webhook_url and project_webhook_secret
+                    parameters and calls session_events.deliver_session_started()
+                    after the Gemini session opens and
+                    session_events.deliver_session_closed() in the finally block
+                    alongside the MongoDB session record write.
+ 
+  Both deliveries are fire-and-forget (asyncio.create_task inside
+  session_events) so they never block the session lifecycle path.
 """
 
 from __future__ import annotations
@@ -66,6 +77,7 @@ from google import genai
 from google.genai import types
 
 from .schemas import ProjectConfig
+from .session_events import deliver_session_started, deliver_session_closed
 from .session_state import SessionState, FrameKind, InputFrame, _OUTBOX_STOP
 from .tool_executor import ToolExecutor
 
@@ -140,7 +152,6 @@ async def _handle_tool_call(
             call_id=getattr(fc, "id", ""),
         )
 
-        # Increment tool call counter on the session state
         state.tool_calls += 1
 
         await state.send_outbox((
@@ -173,24 +184,6 @@ async def _handle_tool_call(
 # ──────────────────────────────────────────────────────────────
 
 def _capture_usage(state: SessionState, usage: Any) -> None:
-    """
-    Extract token counts from a Gemini usage_metadata object and update
-    the SessionState counters.
- 
-    The Live API sends usage_metadata periodically on server messages.
-    Values are CUMULATIVE (total since session start), so we simply
-    overwrite with the latest values rather than accumulating.
- 
-    Fields on the usage_metadata object (google.genai.types.UsageMetadata):
-      total_token_count      — total input + output tokens
-      prompt_token_count     — input tokens
-      candidates_token_count — output tokens
-      response_tokens_details — list of ModalityTokenCount (optional)
- 
-    For the Live API, audio-only sessions may not report
-    prompt_token_count separately, so we fall back to computing
-    input = total - output as a safe estimate.
-    """
     if usage is None:
         return
  
@@ -199,8 +192,6 @@ def _capture_usage(state: SessionState, usage: Any) -> None:
     response = getattr(usage, "candidates_token_count", 0) or 0
  
     if total and not prompt and not response:
-        # Live API audio session — only total is available
-        # Store total in output_tokens for simplicity; input_tokens stays 0
         state.output_tokens = total
     else:
         state.input_tokens  = prompt
@@ -221,25 +212,17 @@ async def _consume_gemini_responses(
     state:     SessionState,
     executor:  ToolExecutor,
 ) -> bool:
-    """
-    Drain Gemini's response stream for one turn.
-
-    Returns True on turn_complete/interrupted, False on session close.
-    Also captures usage_metadata and increments turn counter.
-    """
     sid = state.session_id
 
     try:
         async for response in gsession.receive():
  
-            # ── Usage metadata (cumulative, sent periodically) ─────
             if response.usage_metadata:
                 _capture_usage(state, response.usage_metadata)
  
             sc = response.server_content
 
             if sc is not None:
-                # ── Audio PCM ─────────────────────────────────────
                 if sc.model_turn and sc.model_turn.parts:
                     for part in sc.model_turn.parts:
                         if part.inline_data and part.inline_data.data:
@@ -248,35 +231,28 @@ async def _consume_gemini_responses(
                                     ("audio_pcm", part.inline_data.data)
                                 )
 
-                # ── Output transcription ───────────────────────────
                 if sc.output_transcription and sc.output_transcription.text:
                     await state.send_outbox(
                         ("assistant_text", sc.output_transcription.text)
                     )
-                    log.debug("[%s] assistant_text: %r", sid, sc.output_transcription.text)
 
-                # ── Input transcription ────────────────────────────
                 if sc.input_transcription and sc.input_transcription.text:
                     await state.send_outbox(
                         ("user_transcript", sc.input_transcription.text)
                     )
-                    log.debug("[%s] user_transcript: %r", sid, sc.input_transcription.text)
 
-                # ── Barge-in ───────────────────────────────────────
                 if sc.interrupted:
                     log.info("[%s] Gemini interrupted generation", sid)
                     state.turns += 1
                     await state.send_outbox(("turn_complete", None))
                     return True
 
-                # ── Turn complete ──────────────────────────────────
                 if sc.turn_complete:
                     state.turns += 1
                     await state.send_outbox(("turn_complete", None))
                     log.info("[%s] turn_complete (turns=%d)", sid, state.turns)
                     return True
 
-            # ── Tool calls ─────────────────────────────────────────
             if response.tool_call:
                 await _handle_tool_call(gsession, state, response.tool_call, executor)
 
@@ -304,13 +280,18 @@ async def session_runner(
     """
     Opens ONE Gemini Live session and processes turns until stopped.
  
-    session_repo is optional for backward compatibility.  When provided
-    (always the case in production) it writes a SessionDoc to MongoDB in
-    the finally block — fixing the missing session logs issue.
+    Delivers session lifecycle webhooks to project.webhook_url on open
+    and close.  Both deliveries are fire-and-forget and never block the
+    session lifecycle path.
     """
-    sid    = state.session_id
-    status = "closed"
+    sid           = state.session_id
+    status        = "closed"
     error_message: str | None = None
+
+    # Pull webhook config from the project config (stored on ProjectConfig
+    # via ProjectDoc.to_project_config — added in this release).
+    webhook_url    = getattr(project, "webhook_url",    None)
+    webhook_secret = getattr(project, "webhook_secret", None)
  
     log.info("[%s] runner starting (project=%s)", sid, project.project_id)
 
@@ -325,6 +306,17 @@ async def session_runner(
         ) as gsession:
 
             log.info("[%s] Gemini session open", sid)
+ 
+            # Notify customer that session is live
+            await deliver_session_started(
+                webhook_url    = webhook_url,
+                webhook_secret = webhook_secret,
+                session_id     = sid,
+                project_id     = project.project_id,
+                tenant_id      = project.tenant_id,
+                started_at     = state.started_at,
+            )
+ 
             await state.send_outbox((
                 "session_ready",
                 {
@@ -448,9 +440,10 @@ async def session_runner(
         if _recv_task and not _recv_task.done():
             _recv_task.cancel()
 
-        # ── Persist session record to MongoDB ─────────────────────
-        # This is the fix: session_repo.close_session() is always called
-        # here so every session produces an analytics record.
+        ended_at = datetime.now(timezone.utc)
+        duration = (ended_at - state.started_at).total_seconds()
+
+        # ── Persist session record ─────────────────────────────
         if session_repo is not None:
             try:
                 await session_repo.close_session(
@@ -467,8 +460,25 @@ async def session_runner(
                     api_key_id    = state.api_key_id,
                 )
             except Exception as exc:
-                # Never crash the shutdown path over an analytics write
                 log.error("[%s] failed to write session record: %s", sid, exc)
+
+        # ── Deliver session closed webhook ─────────────────────
+        await deliver_session_closed(
+            webhook_url      = webhook_url,
+            webhook_secret   = webhook_secret,
+            session_id       = sid,
+            project_id       = project.project_id,
+            tenant_id        = project.tenant_id,
+            status           = status,
+            started_at       = state.started_at,
+            ended_at         = ended_at,
+            duration_seconds = round(duration, 2),
+            turns            = state.turns,
+            tool_calls       = state.tool_calls,
+            input_tokens     = state.input_tokens,
+            output_tokens    = state.output_tokens,
+            error_message    = error_message,
+        )
 
         log.info(
             "[%s] runner shutdown (status=%s turns=%d input_tokens=%d output_tokens=%d)",
