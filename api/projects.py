@@ -143,6 +143,14 @@ class VoiceConfigRequest(BaseModel):
     language_code: str  = "en-US"
     enabled:       bool = True
 
+    @field_validator("language_code", mode="before")
+    @classmethod
+    def validate_language_code(cls, v: str) -> str:
+        """Coerce empty strings to the default value before validation."""
+        if isinstance(v, str):
+            v = v.strip()
+        return v or "en-US"
+
 
 class VADConfigRequest(BaseModel):
     mode: str = "manual"
@@ -212,6 +220,14 @@ class VoiceConfigUpdateRequest(BaseModel):
     language_code: str  = Field(default="en-US", min_length=2, max_length=16)
     enabled:       bool = True
     vad_mode:      str  = "manual"
+
+    @field_validator("language_code", mode="before")
+    @classmethod
+    def validate_language_code(cls, v: str) -> str:
+        """Coerce empty strings to the default value before validation."""
+        if isinstance(v, str):
+            v = v.strip()
+        return v or "en-US"
 
     @field_validator("vad_mode")
     @classmethod
