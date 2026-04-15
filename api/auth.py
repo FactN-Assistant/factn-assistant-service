@@ -237,22 +237,10 @@ async def refresh(request: Request, response: Response) -> AuthResponse:
     if not raw_refresh:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token missing.")
 
-    raw_access = request.cookies.get("access_token")
-    tenant_id: str | None = None
-
-    if raw_access:
-        from core.auth import decode_access_token
-        payload = decode_access_token(raw_access)
-        if payload:
-            tenant_id = payload.get("sub")
-
-    if not tenant_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Session expired — please log in again.",
-        )
-
-    result = await repos.auth_tokens.verify_and_rotate(raw_refresh, tenant_id)
+    # Verify and rotate the refresh_token. Pass tenant_id=None so we search across
+    # all tenants — this is safe because the token hash is cryptographically unique.
+    # (The access_token may be expired, so we can't rely on decoding it to get tenant_id.)
+    result = await repos.auth_tokens.verify_and_rotate(raw_refresh, tenant_id=None)
     if result is None:
         _clear_auth_cookies(response)
         raise HTTPException(
@@ -260,7 +248,8 @@ async def refresh(request: Request, response: Response) -> AuthResponse:
             detail="Refresh token is invalid or expired — please log in again.",
         )
 
-    _, new_refresh_token = result
+    new_doc, new_refresh_token = result
+    tenant_id = new_doc.tenant_id
 
     tenant = await repos.tenants.get_by_id(tenant_id)
     if tenant is None or not tenant.is_active:
