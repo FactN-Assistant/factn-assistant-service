@@ -86,11 +86,14 @@ class AuthTokenRepository:
     # ── Verify and rotate ─────────────────────────────────────
 
     async def verify_and_rotate(
-        self, raw_token: str, tenant_id: str
+        self, raw_token: str, tenant_id: str | None = None
     ) -> tuple[AuthTokenDoc, str] | None:
         """
         Verify a refresh token, delete the old document, and issue a new one
         in the same family (token rotation).
+
+        If tenant_id is None, search across all tenants. This is used when
+        the access_token is expired and we can't extract tenant_id from it.
 
         Returns (new_doc, new_raw_token) on success.
         Returns None if the token is invalid or expired.
@@ -99,11 +102,15 @@ class AuthTokenRepository:
         the same family exists, that means a superseded token was reused —
         all tokens in that family are invalidated immediately.
         """
-        # Find all documents for this tenant to verify against
-        cursor = self._col.find({
-            "tenant_id":  tenant_id,
+        # Build the query — if tenant_id is provided, include it; otherwise search all tenants
+        query = {
             "expires_at": {"$gt": datetime.now(timezone.utc)},
-        })
+        }
+        if tenant_id:
+            query["tenant_id"] = tenant_id
+
+        # Find all valid (non-expired) documents
+        cursor = self._col.find(query)
 
         matched_doc: AuthTokenDoc | None = None
         async for raw_doc in cursor:
@@ -118,7 +125,8 @@ class AuthTokenRepository:
         if matched_doc is None:
             # No matching token — check for reuse attack (same family exists
             # but this specific token was already rotated away).
-            await self._check_and_kill_reused_family(raw_token, tenant_id)
+            if tenant_id:
+                await self._check_and_kill_reused_family(raw_token, tenant_id)
             return None
 
         # Delete the consumed token
@@ -126,7 +134,7 @@ class AuthTokenRepository:
 
         # Issue a new token in the same family
         new_doc, new_raw = await self.create(
-            tenant_id=tenant_id,
+            tenant_id=matched_doc.tenant_id,
             token_family=matched_doc.token_family,
         )
         return new_doc, new_raw
