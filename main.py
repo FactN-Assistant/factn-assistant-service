@@ -63,6 +63,7 @@ from google import genai
 from api.auth import router as auth_router
 from api.tokens import router as tokens_router
 from api.projects import router as projects_router
+from api.plans import router as plans_router
 from api.chat import router as chat_router
 from api.keys import router as keys_router
 from core.plan_limits import PLAN_LIMITS
@@ -180,6 +181,7 @@ app.add_middleware(
 # ── Routers ───────────────────────────────────────────────────
 app.include_router(auth_router)
 app.include_router(projects_router)
+app.include_router(plans_router)
 app.include_router(tokens_router)
 app.include_router(chat_router)
 app.include_router(keys_router)
