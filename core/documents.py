@@ -142,6 +142,8 @@ class ProjectDoc(BaseModel):
             max_concurrent_sessions = self.max_concurrent_sessions,
             rate_limit_rpm          = self.rate_limit_rpm,
             allowed_origins         = self.allowed_origins,
+            webhook_url             = self.webhook_url,
+            webhook_secret          = self.webhook_secret,
         )
 
 

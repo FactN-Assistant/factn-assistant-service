@@ -147,7 +147,8 @@ class SessionRepository:
                 }},
             }},
         ]
-        results = await self._col.aggregate(pipeline).to_list(None)
+        cursor = await self._col.aggregate(pipeline)
+        results = await cursor.to_list(None)
         if not results:
             return {
                 "total_sessions":      0,
@@ -189,7 +190,8 @@ class SessionRepository:
                 },
             }},
         ]
-        results = await self._col.aggregate(pipeline).to_list(None)
+        cursor = await self._col.aggregate(pipeline)
+        results = await cursor.to_list(None)
         if not results:
             return 0
         return results[0].get("total_tokens", 0)

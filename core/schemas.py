@@ -84,3 +84,6 @@ class ProjectConfig(BaseModel):
     session_ttl_seconds:     int = 300
     max_concurrent_sessions: int = 100
     rate_limit_rpm:          int = 60
+    allowed_origins:         list[str] = Field(default_factory=list)
+    webhook_url:             str | None = None
+    webhook_secret:          str | None = None
