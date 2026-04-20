@@ -866,10 +866,21 @@ async def _run_test_turn(
         async for response in gsession.receive():
             if response.usage_metadata:
                 usage = response.usage_metadata
-                input_tokens  = getattr(usage, "prompt_token_count",     0) or 0
-                output_tokens = getattr(usage, "candidates_token_count", 0) or 0
-                if not input_tokens and not output_tokens:
-                    output_tokens = getattr(usage, "total_token_count", 0) or 0
+                input_tokens  = getattr(usage, "prompt_token_count", 0) or 0
+                # Try response_token_count first (newer SDK)
+                output_tokens = getattr(usage, "response_token_count", 0) or 0
+                # Fall back to response_tokens_details (Live API modality breakdown)
+                if not output_tokens:
+                    details = getattr(usage, "response_tokens_details", None)
+                    if details:
+                        output_tokens = sum(getattr(d, "token_count", 0) or 0 for d in details)
+                # Last resort: derive from total - prompt
+                if not output_tokens:
+                    total = getattr(usage, "total_token_count", 0) or 0
+                    if total and input_tokens:
+                        output_tokens = total - input_tokens
+                    elif total:
+                        output_tokens = total
 
             sc = response.server_content
             if sc is not None:

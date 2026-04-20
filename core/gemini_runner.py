@@ -189,13 +189,22 @@ def _capture_usage(state: SessionState, usage: Any) -> None:
  
     total    = getattr(usage, "total_token_count",      0) or 0
     prompt   = getattr(usage, "prompt_token_count",     0) or 0
-    response = getattr(usage, "candidates_token_count", 0) or 0
- 
-    if total and not prompt and not response:
-        state.output_tokens = total
-    else:
-        state.input_tokens  = prompt
-        state.output_tokens = response
+
+    # Try response_token_count first (newer SDK versions)
+    response = getattr(usage, "response_token_count", 0) or 0
+
+    # Fall back to summing response_tokens_details (Live API modality breakdown)
+    if not response:
+        details = getattr(usage, "response_tokens_details", None)
+        if details:
+            response = sum(getattr(d, "token_count", 0) or 0 for d in details)
+
+    # Last resort: derive from total - prompt
+    if not response and total and prompt:
+        response = total - prompt
+
+    state.input_tokens  = prompt or 0
+    state.output_tokens = response or 0
  
     log.debug(
         "[%s] usage_metadata: total=%d prompt=%d response=%d",
