@@ -117,9 +117,10 @@ class ProjectDoc(BaseModel):
     session_ttl_seconds:     int          = 300
     max_concurrent_sessions: int          = 10
     rate_limit_rpm:          int          = 60
-    created_at:              datetime     = Field(default_factory=_now)
-    updated_at:              datetime     = Field(default_factory=_now)
-    is_active:               bool         = True
+    created_at:              datetime      = Field(default_factory=_now)
+    updated_at:              datetime      = Field(default_factory=_now)
+    last_accessed:           datetime | None = None
+    is_active:               bool          = True
 
     def to_mongo(self) -> dict[str, Any]:
         return self.model_dump(by_alias=True)

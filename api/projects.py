@@ -244,6 +244,32 @@ class WebhookConfigRequest(BaseModel):
     allowed_origins: list[str]   = Field(default_factory=list)
 
 
+class ProjectSummaryResponse(BaseModel):
+    """Lightweight shape returned by GET /v1/projects (the list endpoint).
+
+    Intentionally omits system_prompt, tools, voice/vad configs and other
+    heavy fields to keep list payloads small.  The full ProjectResponse is
+    only fetched for the single selected project via GET /v1/projects/{id}.
+    """
+    project_id:   str
+    name:         str
+    description:  str
+    is_active:    bool
+    updated_at:   str
+    last_accessed: str | None
+
+    @classmethod
+    def from_doc(cls, doc: ProjectDoc) -> "ProjectSummaryResponse":
+        return cls(
+            project_id    = doc.id,
+            name          = doc.name,
+            description   = doc.description,
+            is_active     = doc.is_active,
+            updated_at    = doc.updated_at.isoformat(),
+            last_accessed = doc.last_accessed.isoformat() if doc.last_accessed else None,
+        )
+
+
 class ProjectResponse(BaseModel):
     project_id:              str
     tenant_id:               str
@@ -445,14 +471,14 @@ async def list_projects(
     limit:   int = 50,
     skip:    int = 0,
     tenant:  TenantDoc = Depends(get_current_tenant),
-) -> list[ProjectResponse]:
+) -> list[ProjectSummaryResponse]:
     repos: Repositories = request.app.state.repos
     docs = await repos.projects.list_for_tenant(
         tenant_id = tenant.id,
         limit     = min(limit, 100),
         skip      = skip,
     )
-    return [ProjectResponse.from_doc(d) for d in docs]
+    return [ProjectSummaryResponse.from_doc(d) for d in docs]
 
 
 @router.get("/{project_id}")
@@ -463,7 +489,11 @@ async def get_project(
 ) -> ProjectResponse:
     repos: Repositories = request.app.state.repos
     doc = await repos.projects.get_by_id(project_id, tenant_id=tenant.id)
-    return ProjectResponse.from_doc(_get_project_or_404(doc, project_id))
+    _get_project_or_404(doc, project_id)
+    # Record that this project was accessed — used to auto-select the most
+    # recently viewed project in the dashboard on next login.
+    await repos.projects.touch_last_accessed(project_id, tenant.id)
+    return ProjectResponse.from_doc(doc)  # type: ignore[arg-type]
 
 
 @router.patch("/{project_id}")

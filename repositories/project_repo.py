@@ -187,6 +187,18 @@ class ProjectRepository:
             log.info("Project updated: %s", project_id)
         return result.modified_count == 1
 
+    async def touch_last_accessed(self, project_id: str, tenant_id: str) -> None:
+        """
+        Non-blocking update of last_accessed without invalidating the config
+        cache — this field is only used for dashboard sorting and does not
+        affect runtime behaviour.
+        """
+        await self._col.update_one(
+            {"_id": project_id, "tenant_id": tenant_id},
+            {"$set": {"last_accessed": datetime.now(timezone.utc)}},
+        )
+        log.debug("Project last_accessed touched: %s", project_id)
+
     async def set_tools(
         self,
         project_id: str,
