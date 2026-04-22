@@ -352,6 +352,16 @@ async def session_runner(
 
                 if frame.kind == FrameKind.ACTIVITY_START:
                     log.debug("[%s] activity_start → Gemini", sid)
+
+                    # Cancel any lingering recv task from a prior voice turn
+                    if _recv_task is not None and not _recv_task.done():
+                        _recv_task.cancel()
+                        try:
+                            await _recv_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        _recv_task = None
+
                     try:
                         await gsession.send_realtime_input(
                             activity_start=types.ActivityStart()
@@ -402,6 +412,13 @@ async def session_runner(
                     continue
 
                 if frame.kind == FrameKind.TEXT:
+                    # Drop text input while a voice turn is active.
+                    # Cancelling the in-flight voice receiver here can leave
+                    # stale Gemini events that break the next normal text turn.
+                    if _recv_task is not None and not _recv_task.done():
+                        log.debug("[%s] dropping text input — voice turn active", sid)
+                        continue
+
                     try:
                         await gsession.send_client_content(
                             turns=[
