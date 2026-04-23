@@ -66,6 +66,7 @@ from api.projects import router as projects_router
 from api.plans import router as plans_router
 from api.chat import router as chat_router
 from api.keys import router as keys_router
+from core import config
 from core.plan_limits import PLAN_LIMITS
 from core.session_manager import SessionManager
 from db.indexes import ensure_indexes
@@ -101,11 +102,11 @@ async def lifespan(app: FastAPI):
     2.  Redis.close()
     3.  MongoDB.close()
     """
-    mongo_uri  = os.environ.get("MONGO_URI", "")
-    mongo_db   = os.environ.get("MONGO_DB_NAME", "livechat_dev")
-    redis_url  = os.environ.get("REDIS_URL", "redis://localhost:6379")
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    jwt_secret = os.environ.get("JWT_SECRET", "")
+    mongo_uri  = config.MONGO_URI
+    mongo_db   = config.MONGO_DB_NAME
+    redis_url  = config.REDIS_URL
+    gemini_key = config.GEMINI_API_KEY
+    jwt_secret = config.JWT_SECRET
 
     if not mongo_uri:
         log.warning("MONGO_URI not set — database calls will fail.")

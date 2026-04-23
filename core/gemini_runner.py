@@ -76,6 +76,7 @@ from datetime import datetime, timezone
 from google import genai
 from google.genai import types
 
+from . import config
 from .schemas import ProjectConfig
 from .session_events import deliver_session_started, deliver_session_closed
 from .session_state import SessionState, FrameKind, InputFrame, _OUTBOX_STOP
@@ -99,26 +100,35 @@ def build_gemini_config(project: ProjectConfig) -> types.LiveConnectConfig:
         for t in project.tools
     ]
 
+    vad_manual = project.vad_config.mode == "manual"
+
+    # VAD: disabled when the project uses manual activity signals, enabled for auto.
+    if vad_manual:
+        realtime_input_config = types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                disabled=True
+            )
+        )
+    else:
+        realtime_input_config = types.RealtimeInputConfig()
+
     config_kwargs: dict[str, Any] = dict(
+        # Always use AUDIO response modality — native audio model required
         response_modalities=["AUDIO"],
         system_instruction=project.system_prompt,
-        output_audio_transcription={},
         input_audio_transcription={},
+        output_audio_transcription={},
         thinking_config=types.ThinkingConfig(
             thinking_budget=0,
             include_thoughts=False,
         ),
+        temperature=0.7,
+        realtime_input_config=realtime_input_config,
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(
                     voice_name=project.voice_config.voice_name,
                 )
-            )
-        ),
-        temperature=0.7,
-        realtime_input_config=types.RealtimeInputConfig(
-            automatic_activity_detection=types.AutomaticActivityDetection(
-                disabled=True
             )
         ),
     )
@@ -302,10 +312,14 @@ async def session_runner(
 
     try:
         async with client.aio.live.connect(
-            model=project.gemini_model, config=gemini_config
+            model=config.GEMINI_MODEL, config=gemini_config
         ) as gsession:
 
             log.info("[%s] Gemini session open", sid)
+
+            # Speaker mode defaults to True for voice-enabled projects so audio
+            # flows immediately; False for text-only projects (cannot be changed).
+            await state.set_speaker_mode(project.voice_config.enabled)
  
             # Notify customer that session is live
             await deliver_session_started(

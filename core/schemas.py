@@ -77,7 +77,6 @@ class ProjectConfig(BaseModel):
     tenant_id:               str  = ""   # populated from DB in Week 5+
     name:                    str
     system_prompt:           str
-    gemini_model:            str  = "gemini-2.5-flash-native-audio-preview-12-2025"
     voice_config:            VoiceConfig  = Field(default_factory=VoiceConfig)
     vad_config:              VADConfig    = Field(default_factory=VADConfig)
     tools:                   list[ToolDefinition] = Field(default_factory=list)

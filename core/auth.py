@@ -39,21 +39,21 @@ worth the extra 200–500 ms because they are presented infrequently.
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, VerificationError
 from jose import jwt, JWTError
+from core import config
 
 log = logging.getLogger("livechat.auth")
 
 # ── JWT configuration ─────────────────────────────────────────
-JWT_SECRET    = os.environ.get("JWT_SECRET", "change-me-in-production")
-JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_TTL_MINUTES  = 15
-REFRESH_TOKEN_TTL_DAYS    = 7   # managed by AuthTokenRepository
+JWT_SECRET    = config.JWT_SECRET
+JWT_ALGORITHM = config.JWT_ALGORITHM
+ACCESS_TOKEN_TTL_MINUTES  = config.ACCESS_TOKEN_TTL_MINUTES
+REFRESH_TOKEN_TTL_DAYS    = config.REFRESH_TOKEN_TTL_DAYS
 
 # ── Password hasher (stronger than API key hasher) ────────────
 _PWD_HASHER = PasswordHasher(
