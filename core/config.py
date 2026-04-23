@@ -44,6 +44,9 @@ GEMINI_MODEL
 """
 
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # MongoDB Configuration
 MONGO_URI = os.getenv("MONGO_URI", "")
